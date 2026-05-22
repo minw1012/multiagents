@@ -204,10 +204,10 @@ class IntentRouterAgent(BaseAgent):
         ds_hit = any(k in lowered for k in ds_keywords)
 
         if kb_hit and not ds_hit:
-            intent = "KB_QUERY"
+            intent = "KNOWLEDGE_LOOKUP"
             receiver = "kb_retriever"
         else:
-            intent = "DS_PIPELINE"
+            intent = "ML_WORKFLOW"
             receiver = "planner"
 
         state["intent"] = intent
@@ -236,7 +236,7 @@ class KBRetrieverAgent(BaseAgent):
             "type": "final_result",
             "priority": 75,
             "content": {
-                "intent": "KB_QUERY",
+                "intent": "KNOWLEDGE_LOOKUP",
                 "summary": "已检索知识库相关历史信息。",
                 "snippets": snippets,
             },
@@ -363,7 +363,7 @@ class ReporterAgent(BaseAgent):
             "type": "final_result",
             "priority": 80,
             "content": {
-                "intent": "DS_PIPELINE",
+                "intent": "ML_WORKFLOW",
                 "summary": "已完成数据处理、模型训练评估，并生成报告。",
                 "report": report["report_markdown"],
                 "best_model": report["best_model"],
@@ -549,4 +549,3 @@ class MultiAgentSystem:
         self.memory.put("workflow", trace_id, {"state": state, "final_message": message})
         self.memory.append_session_message(session_id, "assistant_structured", str(message["content"]))
         return message, state
-

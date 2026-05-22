@@ -59,7 +59,7 @@ class ChatResponder:
 
     def _fallback(self, result: Dict[str, Any], trace: str) -> str:
         intent = result.get("intent", "UNKNOWN")
-        if intent == "KB_QUERY":
+        if intent in {"KNOWLEDGE_LOOKUP", "KB_QUERY"}:
             rows = result.get("snippets", [])
             if not rows:
                 return f"[{trace}] 知识库没有检索到匹配内容。"
@@ -67,7 +67,7 @@ class ChatResponder:
             for i, row in enumerate(rows, start=1):
                 lines.append(f"{i}. {row.get('snippet', '')} (source: {row.get('source', '')})")
             return "\n".join(lines)
-        if intent == "DS_PIPELINE":
+        if intent in {"ML_WORKFLOW", "DS_PIPELINE"}:
             return (
                 f"[{trace}] 已完成流程。最佳模型: {result.get('best_model', 'N/A')}\n"
                 f"{result.get('report', '')}"
@@ -138,4 +138,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
