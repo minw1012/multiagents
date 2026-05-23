@@ -37,8 +37,8 @@ class ChatResponder:
 
         system_prompt = (
             "You are an assistant for a multi-agent ML platform. "
-            "Respond in concise Chinese. If KB query, summarize findings with sources. "
-            "If DS pipeline, summarize data/model/evaluation/report clearly."
+            "Respond in concise Chinese. "
+            "For dynamic execution results, clearly summarize goal, executed tools, and outcome."
         )
         user_prompt = {
             "user_input": user_input,
@@ -98,6 +98,56 @@ class ChatResponder:
             return (
                 "\n".join(lines)
             )
+        if intent == "DYNAMIC_EXECUTION":
+            lines = [
+                f"[{trace}] Dynamic loop finished ({result.get('status', 'completed')}).",
+            ]
+            goal = result.get("goal")
+            if goal:
+                lines.append(f"Goal: {goal}")
+            plan = result.get("plan", [])
+            if plan:
+                lines.append("Plan:")
+                for i, step in enumerate(plan, start=1):
+                    lines.append(f"{i}. {step}")
+            executed_tools = result.get("executed_tools", [])
+            if executed_tools:
+                lines.append("Executed tools: " + " -> ".join(executed_tools))
+            summary = result.get("result_summary", "")
+            if summary:
+                lines.append("")
+                lines.append("Result:")
+                lines.append(summary)
+            observations = result.get("observations", [])
+            if observations:
+                lines.append("")
+                lines.append("Observations:")
+                for i, row in enumerate(observations[-4:], start=1):
+                    tool = row.get("tool", "unknown_tool")
+                    ok = row.get("ok", True)
+                    if ok:
+                        lines.append(f"{i}. {tool}: ok")
+                    else:
+                        lines.append(f"{i}. {tool}: failed ({row.get('error', 'unknown error')})")
+            return "\n".join(lines)
+        if intent == "DOC_SUMMARY":
+            if not result.get("ok", True):
+                return f"[{trace}] DOC_SUMMARY failed: {result.get('error', 'unknown error')}"
+            lines = [
+                f"[{trace}] Document summary complete.",
+                f"Source: {result.get('source_path', 'N/A')}",
+                f"Word count: {result.get('word_count', 0)}",
+                "",
+                "Summary:",
+                result.get("summary", ""),
+            ]
+            highlights = result.get("highlights", [])
+            if highlights:
+                lines.append("")
+                lines.append("Highlights:")
+                for i, row in enumerate(highlights, start=1):
+                    lines.append(f"{i}. {row}")
+            return "\n".join(lines)
         return f"[{trace}] {json.dumps(result, ensure_ascii=False, indent=2)}"
 
 
@@ -107,6 +157,7 @@ def print_help() -> None:
     print("  /tools       查看已注册工具")
     print("  /skills list")
     print("  /skills install <repo_url> [alias] [ref]")
+    print("  /file summarize <path_to_docx_or_pdf>")
     print("  /raw on|off  是否显示结构化结果")
     print("  /help        显示帮助")
 
@@ -158,6 +209,29 @@ def main() -> None:
                 print(json.dumps(result, ensure_ascii=False, indent=2))
             else:
                 print("用法: /skills list | /skills install <repo_url> [alias] [ref]")
+            continue
+        if user_input.startswith("/file"):
+            parts = user_input.split(maxsplit=2)
+            if len(parts) == 3 and parts[1] == "summarize":
+                file_path = parts[2].strip()
+                explicit = json.dumps(
+                    {
+                        "intent": "DOC_SUMMARY",
+                        "mode": "EXECUTE",
+                        "file_path": file_path,
+                    },
+                    ensure_ascii=False,
+                )
+                final_message, state = app.run(explicit, session_id=args.session_id)
+                trace = state["trace_id"]
+                content = final_message.get("content", {})
+                if show_raw:
+                    print(json.dumps(content, ensure_ascii=False, indent=2))
+                else:
+                    text = responder.render(user_input=user_input, result=content, trace=trace)
+                    print(f"Agent> {text}")
+            else:
+                print("用法: /file summarize <path_to_docx_or_pdf>")
             continue
         if user_input.startswith("/raw"):
             parts = user_input.split()
