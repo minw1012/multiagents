@@ -1,13 +1,21 @@
-# Multiagents
+# Multiagents: A Model-Driven Tool-Using Agent Harness for Terminal Workflows
 
-A Codex-inspired, model-driven agent runtime for terminal workflows.
+## Abstract
+This repository implements a practical agent runtime centered on a single principle: the language model decides *when* to call tools and *when* to stop, while the runtime executes requested actions, records observations, enforces policy, and returns control to the model. The system targets mixed terminal tasks including document analysis, tabular data workflows, code-oriented operations, local knowledge lookup, and controlled network/database/browser-style actions. The implementation combines an LLM-native tool loop with a deterministic fallback path for robustness when model access is unavailable.
 
-It is built around one core idea:
-- the model decides when to call tools
-- the runtime executes tool calls and feeds results back
-- the loop continues until the model stops
+## 1. Problem Statement
+Most task agents fail for one of two reasons:
+1. Routing logic is overfit to brittle keyword rules.
+2. Tool execution is under-specified (weak safety boundaries, poor recovery after failures).
 
-## The Agent Pattern
+This project addresses both by building around a canonical iterative loop and a domain harness that provides:
+- operational tools,
+- memory and state,
+- observation streams,
+- safety/permission constraints,
+- failure reflection and recovery.
+
+## 2. Core Agent Pattern
 
 ```text
                     THE AGENT PATTERN
@@ -22,70 +30,160 @@ It is built around one core idea:
                     execute tools                    return text
                     append results
                     loop back -----------------> messages[]
-
-
-    The model decides when to call tools and when to stop.
-    The code just executes what the model asks for.
-    This repo builds everything around this loop.
 ```
 
-## Harness Design
+### 2.1 Operational Interpretation
+- The model is the controller.
+- The harness is the executor.
+- The loop terminates only when the model emits a non-tool answer (or safety/iteration limits trigger termination).
+
+## 3. Method
+
+### 3.1 System Definition
+Let the runtime state be:
+- `M_t`: message history at iteration `t`
+- `T`: tool registry (name, schema, handler, permission)
+- `P`: execution policy and trust boundaries
+- `S_t`: workflow state (observations, tool outputs, events, recovery stats)
+
+At each step, the model receives `M_t` (+ tool schemas) and returns either:
+- a set of tool calls, or
+- final text.
+
+Tool calls are validated against policy `P`, executed, converted to structured tool results, appended to `M_{t+1}`, and fed back to the model.
+
+### 3.2 Algorithm (Runtime Skeleton)
+
+```python
+def agent_loop(messages, tools, policy):
+    while True:
+        response = llm(messages=messages, tools=tools)
+        messages.append(response.as_assistant_message())
+
+        if response.stop_reason != "tool_use":
+            return response.text
+
+        results = []
+        for call in response.tool_calls:
+            if not policy.allow(call):
+                output = {"ok": False, "error": "blocked by policy"}
+            else:
+                output = execute_tool(call)
+            results.append(tool_result(call.id, output))
+
+        messages.append(user_message(results))
+```
+
+## 4. Harness Architecture
 
 ```text
 Harness = Tools + Knowledge + Observation + Action Interfaces + Permissions
 ```
 
-- `Tools`: file I/O, shell, document parsing, tabular analysis, network, sqlite, browser-like inspection
-- `Knowledge`: local markdown/docs + ingested references + searchable memory
-- `Observation`: tool outputs, workflow events, git/log/browser state tools
-- `Action Interfaces`: CLI chat, structured tool calls, code/file updates, command execution
-- `Permissions`: policy-based risk checks (low/medium/high), trust boundaries, explicit approval for risky actions
+### 4.1 Tools
+Implemented in `build_tool_registry(...)` in `multi_agent_system.py`.
 
-## Runtime Behavior
+Representative groups:
+- File/search: `list_workspace_files`, `search_workspace_text`, `read_text_file`, `write_text_file`
+- Document: `read_document_file`, `summarize_text`, `extract_key_points`
+- Tabular: `read_spreadsheet_preview`, `profile_tabular_columns`, `analyze_tabular_with_python`
+- Code: `read_code_file`, `read_code_span`, `replace_text_in_file`, `run_shell_command`
+- ML blocks: `process_data`, `model_suggest`, `tune_models`, `train_models`, `evaluate_models`, `generate_report`
+- Knowledge: `kb_search`, `knowledge_ingest_workspace_docs`, `knowledge_list_sources`, `knowledge_get_doc`
+- Skills: `skill_install_from_git`, `skill_list_installed`
+- Network/DB/Browser: `network_http_request`, `network_download_file`, `sqlite_query`, `browser_open_page`, `browser_click_link`
+- Observation: `observe_git_diff`, `observe_error_logs`, `observe_recent_events`, `observe_browser_state`
 
-`DynamicLoopOrchestrator` (`multi_agent_system.py`) runs in this order:
+### 4.2 Memory and State
+`MemoryStore` (same file) maintains:
+- `session`: short-turn chat history
+- `workflow`: trace events and artifacts
+- `knowledge`: ingested documents and metadata
+- `experience`: solved-problem summaries and reusable skill candidates
+- `profile`: user preferences
 
-1. Try model-native tool loop first (OpenAI Responses + tools).
-2. If unavailable, use local fallback planning and execution.
-3. Execute tools, store observations, reflect/recover when needed.
-4. Return final answer or focused clarification.
+### 4.3 Orchestration Layers
+`DynamicLoopOrchestrator` executes two-tier control:
+1. **Primary path**: model-native tool loop (`_run_model_tool_loop`) using OpenAI Responses API tools interface.
+2. **Fallback path**: local planning/decision/recovery path when model access is unavailable or fails.
 
-## What This Project Can Do
+### 4.4 Policy and Trust Boundaries
+`ExecutionPolicy` provides permission-aware gating:
+- risk levels by permission class (`low`, `medium`, `high`)
+- explicit approval requirement for high-risk actions
+- network trust checks (scheme, private hosts, trusted domain policy)
+- filesystem boundary checks for database paths
 
-- Knowledge lookup from workspace docs/history
-- Document summary (`.pdf/.docx/.txt/.md`)
-- Tabular data analysis (`.csv/.xlsx`)
-- ML workflow blocks (prep, model suggest, train, evaluate, report)
-- Code-task support (read/edit/search/run command)
-- Skill install/list from Git repositories
-- Network/sqlite/browser-style utility calls (policy controlled)
+## 5. Reliability Mechanisms
 
-## Quick Start
+### 5.1 Reflection and Recovery
+On tool failure, the runtime performs:
+1. failure classification (`missing_input`, `parse_error`, `timeout`, `policy_block`, etc.)
+2. recovery-step synthesis
+3. dynamic plan injection
+4. continuation or targeted clarification
 
-### 1) Install dependencies
+Key methods in `multi_agent_system.py`:
+- `_classify_tool_failure(...)`
+- `_build_recovery_steps(...)`
+- `_inject_recovery_steps(...)`
+- `_reflect_and_recover(...)`
 
+### 5.2 Repeat-Guard
+Repeated identical failing calls are bounded; the system requests focused clarification instead of endlessly retrying.
+
+## 6. Reproducibility
+
+### 6.1 Environment
+- Python 3
+- Dependencies in `requirements.txt`:
+  - `openai>=1.40.0`
+  - `pypdf>=5.0.0`
+
+### 6.2 Setup
 ```bash
 python3 -m pip install -r requirements.txt
 ```
 
-### 2) (Optional) enable model-driven tool loop
-
+Optional (enables model-native loop):
 ```bash
-export OPENAI_API_KEY="your_key"
+export OPENAI_API_KEY="<your_key>"
 ```
 
-Without API key, the system still runs with local fallback logic.
-
-### 3) Start terminal chat
-
+### 6.3 Run
 ```bash
 python3 terminal_chat.py --workspace .
 ```
 
-`--workspace .` means tool execution and file operations are scoped to the current directory.
+`--workspace .` scopes default file/tool operations to the current repository directory.
 
-## Terminal Commands
+## 7. Evaluation Protocol (Recommended)
+For rigorous validation, evaluate at least four classes of scenarios:
+1. **Capability queries**: expected to return precise, non-hallucinated capability boundaries.
+2. **Executable tasks**: expected to call appropriate tools and produce concrete outputs.
+3. **Failure handling**: expected to recover or ask targeted clarifications (not generic retries).
+4. **Safety constraints**: expected to block unsafe operations unless explicit approval is provided.
 
+Suggested metrics:
+- task success rate
+- mean tool calls per successful task
+- recovery success rate after first failure
+- policy-violation rate (should be zero)
+- clarification precision (focused vs generic)
+
+## 8. Limitations
+- This is a harness-oriented implementation, not a benchmark-trained autonomous agent.
+- Quality depends on model availability and tool coverage.
+- Network/database actions are policy-controlled and intentionally constrained.
+- Local fallback remains conservative by design.
+
+## 9. Project Structure
+- Runtime and tools: `multi_agent_system.py`
+- Terminal interface: `terminal_chat.py`
+- Redesign notes: `system_redesign.md`
+- Communication notes: `multi_agent_commu.md`
+
+## 10. Quick Terminal Commands
 - `/help`
 - `/tools`
 - `/skills list`
@@ -93,36 +191,3 @@ python3 terminal_chat.py --workspace .
 - `/file summarize <path_to_docx_or_pdf>`
 - `/raw on|off`
 - `/exit`
-
-## Representative Tool Groups
-
-- File + search: `list_workspace_files`, `search_workspace_text`, `read_text_file`, `write_text_file`
-- Document: `read_document_file`, `summarize_text`, `extract_key_points`
-- Tabular: `read_spreadsheet_preview`, `profile_tabular_columns`, `analyze_tabular_with_python`
-- Code: `read_code_file`, `read_code_span`, `replace_text_in_file`, `run_shell_command`
-- ML: `process_data`, `model_suggest`, `train_models`, `evaluate_models`, `generate_report`
-- Knowledge: `kb_search`, `knowledge_ingest_workspace_docs`, `knowledge_list_sources`
-- Skills: `skill_install_from_git`, `skill_list_installed`
-- Network/DB/Browser: `network_http_request`, `sqlite_query`, `browser_open_page`
-- Observation: `observe_git_diff`, `observe_error_logs`, `observe_recent_events`
-
-## Example Prompts
-
-- `could you walk through this workspace?`
-- `please summarize README.md`
-- `analyze data/logreg_dataset.csv`
-- `do you find this key d5bbc8180dba11ecb1e81171463288e9 in the json file`
-- `could you help me download a data we can run it for logistic regression model?`
-
-## Safety Notes
-
-- High-risk actions are policy-gated and may require explicit approval.
-- Network and database calls are constrained by trust-boundary checks.
-- The agent prefers clarification over repeating failing actions.
-
-## File Map
-
-- Main runtime: `multi_agent_system.py`
-- Terminal UI: `terminal_chat.py`
-- Design notes: `system_redesign.md`
-- Loop reference: `multi_agent_commu.md`
