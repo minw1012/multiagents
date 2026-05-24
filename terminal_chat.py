@@ -37,7 +37,7 @@ class ChatResponder:
 
         system_prompt = (
             "You are an assistant for a multi-agent ML platform. "
-            "Respond in concise Chinese. "
+            "Respond in concise English. "
             "For dynamic execution results, clearly summarize goal, executed tools, and outcome."
         )
         user_prompt = {
@@ -57,20 +57,13 @@ class ChatResponder:
             if text:
                 return text.strip()
         except Exception as e:
-            return f"{self._fallback(result, trace)}\n\n(LLM调用失败，已降级。错误: {e})"
+            return f"{self._fallback(result, trace)}\n\n(LLM call failed; fallback used. Error: {e})"
         return self._fallback(result, trace)
 
     def _fallback(self, result: Dict[str, Any], trace: str) -> str:
         intent = result.get("intent", "UNKNOWN")
         if intent == "GENERAL_CHAT":
-            lines = [result.get("reply", "Please provide more details.")]
-            suggestions = result.get("suggestions", [])
-            if suggestions:
-                lines.append("")
-                lines.append("Examples:")
-                for i, text in enumerate(suggestions, start=1):
-                    lines.append(f"{i}. {text}")
-            return "\n".join(lines)
+            return result.get("reply", "Please provide more details.")
         if intent in {"KNOWLEDGE_LOOKUP", "KB_QUERY"}:
             rows = result.get("snippets", [])
             if not rows:
@@ -98,6 +91,34 @@ class ChatResponder:
             return (
                 "\n".join(lines)
             )
+        if intent == "CODE_TASK":
+            lines = [f"[{trace}] Code task finished."]
+            summary = result.get("summary", "")
+            if summary:
+                lines.append(summary)
+            executed_steps = result.get("executed_steps", [])
+            if executed_steps:
+                lines.append("Executed steps: " + " -> ".join(executed_steps))
+            code_path = result.get("code_path")
+            if code_path:
+                lines.append(f"Code path: {code_path}")
+            command = result.get("command")
+            if command:
+                lines.append(f"Command: {command}")
+            command_result = result.get("command_result", {})
+            if isinstance(command_result, dict) and command_result:
+                lines.append(f"Return code: {command_result.get('return_code', 'N/A')}")
+                stdout = (command_result.get("stdout") or "").strip()
+                stderr = (command_result.get("stderr") or "").strip()
+                if stdout:
+                    lines.append("")
+                    lines.append("stdout:")
+                    lines.append(stdout)
+                if stderr:
+                    lines.append("")
+                    lines.append("stderr:")
+                    lines.append(stderr)
+            return "\n".join(lines)
         if intent == "DYNAMIC_EXECUTION":
             lines = [
                 f"[{trace}] Dynamic loop finished ({result.get('status', 'completed')}).",
@@ -136,6 +157,17 @@ class ChatResponder:
                         lines.append(f"{i}. {tool}: ok")
                     else:
                         lines.append(f"{i}. {tool}: failed ({row.get('error', 'unknown error')})")
+            reflections = result.get("reflections", [])
+            if reflections:
+                lines.append("")
+                lines.append("Reflections:")
+                for i, row in enumerate(reflections[-3:], start=1):
+                    reason = row.get("reason", "n/a")
+                    inserted = row.get("inserted_steps", [])
+                    if isinstance(inserted, list) and inserted:
+                        lines.append(f"{i}. {reason} -> {' | '.join([str(x) for x in inserted])}")
+                    else:
+                        lines.append(f"{i}. {reason}")
             events = result.get("event_log_tail", [])
             if events:
                 phases = [str(e.get("phase", "")) for e in events if isinstance(e, dict) and e.get("phase")]
@@ -165,14 +197,14 @@ class ChatResponder:
 
 
 def print_help() -> None:
-    print("命令:")
-    print("  /exit        退出")
-    print("  /tools       查看已注册工具")
+    print("Commands:")
+    print("  /exit        Exit")
+    print("  /tools       List registered tools")
     print("  /skills list")
     print("  /skills install <repo_url> [alias] [ref]")
     print("  /file summarize <path_to_docx_or_pdf>")
-    print("  /raw on|off  是否显示结构化结果")
-    print("  /help        显示帮助")
+    print("  /raw on|off  Toggle raw structured output")
+    print("  /help        Show help")
 
 
 def main() -> None:
@@ -186,9 +218,9 @@ def main() -> None:
     responder = ChatResponder(model=args.model)
     show_raw = False
 
-    print("Multi-Agent Terminal 已启动。输入 /help 查看命令。")
+    print("Multi-Agent Terminal started. Type /help for commands.")
     if not responder.available():
-        print("提示: 未检测到可用 OpenAI 客户端或 OPENAI_API_KEY，当前使用本地降级回复。")
+        print("Note: OpenAI client or OPENAI_API_KEY not detected; using local fallback responses.")
 
     while True:
         try:
@@ -221,7 +253,7 @@ def main() -> None:
                 result = app.tools.execute("skill_install_from_git", repo_url=repo_url, alias=alias, ref=ref)
                 print(json.dumps(result, ensure_ascii=False, indent=2))
             else:
-                print("用法: /skills list | /skills install <repo_url> [alias] [ref]")
+                print("Usage: /skills list | /skills install <repo_url> [alias] [ref]")
             continue
         if user_input.startswith("/file"):
             parts = user_input.split(maxsplit=2)
@@ -244,7 +276,7 @@ def main() -> None:
                     text = responder.render(user_input=user_input, result=content, trace=trace)
                     print(f"Agent> {text}")
             else:
-                print("用法: /file summarize <path_to_docx_or_pdf>")
+                print("Usage: /file summarize <path_to_docx_or_pdf>")
             continue
         if user_input.startswith("/raw"):
             parts = user_input.split()
@@ -252,7 +284,7 @@ def main() -> None:
                 show_raw = parts[1] == "on"
                 print(f"raw mode: {parts[1]}")
             else:
-                print("用法: /raw on|off")
+                print("Usage: /raw on|off")
             continue
 
         final_message, state = app.run(user_input, session_id=args.session_id)

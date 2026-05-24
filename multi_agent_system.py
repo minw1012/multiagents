@@ -7,6 +7,7 @@ import hashlib
 import heapq
 import json
 import logging
+import math
 import os
 import re
 import subprocess
@@ -14,6 +15,7 @@ import time
 import zipfile
 from html import unescape
 from pathlib import Path
+import xml.etree.ElementTree as ET
 
 
 Message = Dict[str, Any]
@@ -54,6 +56,7 @@ DEFAULT_CLARIFICATION_SUGGESTIONS = [
     "Run ML_WORKFLOW for churn prediction using /path/to/data.csv, include report",
     "Run KNOWLEDGE_LOOKUP for historical policy updates about onboarding",
     "Run DOC_SUMMARY for /path/to/file.docx or /path/to/file.pdf",
+    "Run CODE_TASK to inspect/update project files and run tests in workspace",
     "/file summarize /path/to/file.docx",
     "/file summarize /path/to/file.pdf",
     'Use explicit JSON command: {"intent":"ML_WORKFLOW","mode":"EXECUTE","requirements":{...}}',
@@ -61,7 +64,7 @@ DEFAULT_CLARIFICATION_SUGGESTIONS = [
 
 UNSUPPORTED_EXECUTION_REPLY = (
     "This request is outside the currently executable pipeline. "
-    "Current executable scope: KNOWLEDGE_LOOKUP and tabular ML workflow."
+    "Current executable scope: KNOWLEDGE_LOOKUP, DOC_SUMMARY, CODE_TASK, and tabular ML workflow."
 )
 
 
@@ -78,6 +81,7 @@ TOOL_RISK_BY_PERMISSION: Dict[str, str] = {
     "report_write": "medium",
     "kb_write": "medium",
     "file_write": "medium",
+    "code_exec": "medium",
     "skill_install": "high",
 }
 
@@ -138,6 +142,87 @@ def resolve_document_path_from_text(task: str, workspace: Optional[str] = None) 
             stem_hits.append(p)
     if len(stem_hits) == 1:
         return str(stem_hits[0].resolve())
+    return None
+
+
+def resolve_spreadsheet_path_from_text(task: str, workspace: Optional[str] = None) -> Optional[str]:
+    text = task.strip()
+    if not text:
+        return None
+
+    # Absolute path with supported extension.
+    abs_match = re.search(r"(/[^\"'\s]+?\.(?:csv|xlsx))", text, flags=re.IGNORECASE)
+    if abs_match:
+        p = Path(abs_match.group(1)).expanduser().resolve()
+        if p.exists() and p.is_file():
+            return str(p)
+
+    # Quoted path with spaces.
+    quoted = re.findall(r"[\"']([^\"']+\.(?:csv|xlsx))[\"']", text, flags=re.IGNORECASE)
+    for q in quoted:
+        p = Path(q).expanduser()
+        if not p.is_absolute() and workspace:
+            p = Path(workspace) / p
+        p = p.resolve()
+        if p.exists() and p.is_file():
+            return str(p)
+
+    if not workspace:
+        return None
+
+    ws = Path(workspace).expanduser().resolve()
+    if not ws.exists():
+        return None
+
+    candidates = list(ws.glob("*.csv")) + list(ws.glob("*.xlsx"))
+    if not candidates:
+        return None
+
+    low = text.lower()
+    for p in candidates:
+        if p.name.lower() in low:
+            return str(p.resolve())
+
+    norm_task = _normalize_name(text)
+    stem_hits = []
+    for p in candidates:
+        if _normalize_name(p.stem) and _normalize_name(p.stem) in norm_task:
+            stem_hits.append(p)
+    if len(stem_hits) == 1:
+        return str(stem_hits[0].resolve())
+    return None
+
+
+def resolve_code_path_from_text(task: str, workspace: Optional[str] = None) -> Optional[str]:
+    text = task.strip()
+    if not text:
+        return None
+
+    ext_pattern = r"(?:py|js|ts|tsx|jsx|java|go|rs|cpp|c|h|hpp|cs|rb|php|sh|yaml|yml|json|toml|ini|cfg)"
+
+    abs_match = re.search(rf"(/[^\"'\s]+?\.{ext_pattern})", text, flags=re.IGNORECASE)
+    if abs_match:
+        p = Path(abs_match.group(1)).expanduser().resolve()
+        if p.exists() and p.is_file():
+            return str(p)
+
+    quoted = re.findall(rf"[\"']([^\"']+\.{ext_pattern})[\"']", text, flags=re.IGNORECASE)
+    for q in quoted:
+        p = Path(q).expanduser()
+        if not p.is_absolute() and workspace:
+            p = Path(workspace) / p
+        p = p.resolve()
+        if p.exists() and p.is_file():
+            return str(p)
+
+    rel_tokens = re.findall(rf"([A-Za-z0-9_\-./]+\.{ext_pattern})", text, flags=re.IGNORECASE)
+    for token in rel_tokens:
+        p = Path(token).expanduser()
+        if not p.is_absolute() and workspace:
+            p = Path(workspace) / p
+        p = p.resolve()
+        if p.exists() and p.is_file():
+            return str(p)
     return None
 
 
@@ -215,13 +300,15 @@ def parse_explicit_router_command(task: str) -> Optional[Dict[str, Any]]:
         return None
 
     intent = str(parsed.get("intent", "")).upper()
-    if intent not in {"GENERAL_CHAT", "KNOWLEDGE_LOOKUP", "ML_WORKFLOW", "DOC_SUMMARY"}:
+    if intent not in {"GENERAL_CHAT", "KNOWLEDGE_LOOKUP", "ML_WORKFLOW", "DOC_SUMMARY", "CODE_TASK"}:
         return None
 
     mode_raw = str(parsed.get("mode", "EXECUTE")).upper()
     mode = "EXECUTE" if mode_raw in {"EXECUTE", "RUN", "WORKFLOW"} else "ANSWER_ONLY"
     needs_knowledge = parse_bool(parsed.get("needs_knowledge"), default=False)
-    requirements = normalize_requirements(parsed.get("requirements"), task="")
+    requirements: Dict[str, Any] = {}
+    if intent == "ML_WORKFLOW":
+        requirements = normalize_requirements(parsed.get("requirements"), task="")
 
     return {
         "intent": intent,
@@ -234,6 +321,11 @@ def parse_explicit_router_command(task: str) -> Optional[Dict[str, Any]]:
         "reply": str(parsed.get("reply", "")).strip(),
         "suggestions": parsed.get("suggestions", []),
         "requirements": requirements,
+        "code_path": str(parsed.get("code_path", "")).strip() or None,
+        "command": str(parsed.get("command", "")).strip() or None,
+        "find_text": parsed.get("find_text"),
+        "replace_text": parsed.get("replace_text"),
+        "count": parsed.get("count", 1),
         "source": "explicit_command",
     }
 
@@ -295,19 +387,23 @@ class RequestUnderstandingEngine:
             "Executable scope currently includes: "
             "(1) knowledge lookup from loaded docs/history, "
             "(2) tabular ML workflow (preprocess, model select, tune, train, evaluate, report), "
-            "(3) DOC_SUMMARY for reading and summarizing .docx/.pdf files by file path. "
+            "(3) DOC_SUMMARY for reading and summarizing .docx/.pdf files by file path, "
+            "(4) spreadsheet preview/profile for .csv/.xlsx files, "
+            "(5) CODE_TASK for code analysis/editing/testing in workspace via tools. "
             "Computer vision/object detection is not executable in current pipeline."
         )
         user_prompt = {
             "task": task,
             "recent_history": history or [],
-            "allowed_intents": ["GENERAL_CHAT", "KNOWLEDGE_LOOKUP", "ML_WORKFLOW", "DOC_SUMMARY"],
+            "allowed_intents": ["GENERAL_CHAT", "KNOWLEDGE_LOOKUP", "ML_WORKFLOW", "DOC_SUMMARY", "CODE_TASK"],
             "requirement_fields": REQUIREMENT_BOOL_FIELDS + ["model_hint"],
             "instructions": [
                 "For casual chat or capability questions, use GENERAL_CHAT.",
                 "For historical/doc retrieval requests, use KNOWLEDGE_LOOKUP.",
                 "For data/model/training/evaluation/report work, use ML_WORKFLOW.",
                 "For requests to summarize/read a Word/PDF file, use DOC_SUMMARY and extract file_path when present.",
+                "For CSV/XLSX inspection or profiling requests, prefer ML_WORKFLOW with EXECUTE and include file path.",
+                "For codebase analysis/edit/update/test tasks, use CODE_TASK.",
                 "Distinguish answer-only vs execution: capability inquiry should be answer-only.",
                 "Do not claim unsupported execution capabilities.",
                 "Set needs_knowledge=true when ML task should reference knowledge/history/policy/docs.",
@@ -315,13 +411,18 @@ class RequestUnderstandingEngine:
                 "Do not hallucinate constraints.",
             ],
             "output_schema_hint": {
-                "intent": "GENERAL_CHAT | KNOWLEDGE_LOOKUP | ML_WORKFLOW | DOC_SUMMARY",
+                "intent": "GENERAL_CHAT | KNOWLEDGE_LOOKUP | ML_WORKFLOW | DOC_SUMMARY | CODE_TASK",
                 "mode": "ANSWER_ONLY | EXECUTE",
                 "confidence": "0.0-1.0",
                 "needs_knowledge": "bool",
-                "task_domain": "tabular_ml | knowledge | cv | nlp | general",
+                "task_domain": "tabular_ml | knowledge | doc | code | cv | nlp | general",
                 "supported_execution": "bool",
                 "file_path": "string|null",
+                "code_path": "string|null",
+                "command": "string|null",
+                "find_text": "string|null",
+                "replace_text": "string|null",
+                "count": "int",
                 "reply": "string",
                 "suggestions": ["string"],
                 "requirements": {
@@ -357,7 +458,7 @@ class RequestUnderstandingEngine:
 
     def _validate_understanding(self, parsed: Dict[str, Any], task: str, source: str) -> Dict[str, Any]:
         intent = str(parsed.get("intent", "GENERAL_CHAT")).upper()
-        if intent not in {"GENERAL_CHAT", "KNOWLEDGE_LOOKUP", "ML_WORKFLOW", "DOC_SUMMARY"}:
+        if intent not in {"GENERAL_CHAT", "KNOWLEDGE_LOOKUP", "ML_WORKFLOW", "DOC_SUMMARY", "CODE_TASK"}:
             intent = "GENERAL_CHAT"
 
         mode_raw = str(parsed.get("mode", "ANSWER_ONLY")).upper()
@@ -375,12 +476,23 @@ class RequestUnderstandingEngine:
 
         needs_knowledge = bool(parsed.get("needs_knowledge", False))
         file_path = str(parsed.get("file_path", "")).strip() or None
+        code_path = str(parsed.get("code_path", "")).strip() or None
+        command = str(parsed.get("command", "")).strip() or None
+        find_text_raw = parsed.get("find_text")
+        replace_text_raw = parsed.get("replace_text")
+        find_text = find_text_raw if isinstance(find_text_raw, str) and find_text_raw != "" else None
+        replace_text = replace_text_raw if isinstance(replace_text_raw, str) else None
+        try:
+            replace_count = int(parsed.get("count", 1))
+        except Exception:
+            replace_count = 1
+        replace_count = max(1, min(replace_count, 1000))
         task_domain = str(parsed.get("task_domain", "general")).lower().strip()
-        if task_domain not in {"tabular_ml", "knowledge", "cv", "nlp", "doc", "general"}:
+        if task_domain not in {"tabular_ml", "knowledge", "cv", "nlp", "doc", "code", "general"}:
             task_domain = "general"
         supported_execution = parse_bool(
             parsed.get("supported_execution"),
-            default=task_domain in {"tabular_ml", "knowledge", "doc", "general"},
+            default=task_domain in {"tabular_ml", "knowledge", "doc", "code", "general"},
         )
 
         reply = str(parsed.get("reply", "")).strip()
@@ -430,6 +542,11 @@ class RequestUnderstandingEngine:
             "task_domain": task_domain,
             "supported_execution": supported_execution,
             "file_path": file_path,
+            "code_path": code_path,
+            "command": command,
+            "find_text": find_text,
+            "replace_text": replace_text,
+            "count": replace_count,
             "reply": reply,
             "suggestions": suggestions,
             "requirements": req,
@@ -455,6 +572,27 @@ class RequestUnderstandingEngine:
                 "suggestions": [],
                 "requirements": default_workflow_requirements(),
                 "source": f"{source}:file_path_resolver",
+            }
+
+        inferred_code_path = resolve_code_path_from_text(task, workspace=self.workspace)
+        if inferred_code_path:
+            return {
+                "intent": "CODE_TASK",
+                "mode": "EXECUTE",
+                "confidence": 0.82,
+                "needs_knowledge": False,
+                "task_domain": "code",
+                "supported_execution": True,
+                "file_path": None,
+                "code_path": inferred_code_path,
+                "command": None,
+                "find_text": None,
+                "replace_text": None,
+                "count": 1,
+                "reply": "",
+                "suggestions": [],
+                "requirements": {},
+                "source": f"{source}:code_path_resolver",
             }
 
         return {
@@ -602,19 +740,94 @@ class MemoryStore:
         self._must_namespace(namespace)
         if namespace != "knowledge":
             return []
-        q = query.lower().strip()
+        q = (query or "").lower().strip()
+        if not q:
+            return []
         terms = [t for t in re.split(r"[\s,.;:!?，。；：！？、/\\-]+", q) if len(t) >= 2]
-        if not terms and q:
+        if not terms:
             terms = [q]
         rows = list(self._data["knowledge"].values())
-        scored: List[Tuple[int, Dict[str, Any]]] = []
+        if not rows:
+            return []
+
+        # BM25 document statistics
+        doc_tokens: List[List[str]] = []
+        doc_tf: List[Dict[str, int]] = []
+        doc_lengths: List[int] = []
+        df: Dict[str, int] = {}
         for row in rows:
             text = f"{row.get('title', '')}\n{row.get('text', '')}".lower()
-            score = sum(text.count(term) for term in terms)
-            if score > 0:
-                scored.append((score, row))
+            tokens = [t for t in re.split(r"[\s,.;:!?，。；：！？、/\\-]+", text) if t]
+            if not tokens:
+                tokens = ["_empty_"]
+            tf: Dict[str, int] = {}
+            for token in tokens:
+                tf[token] = tf.get(token, 0) + 1
+            for token in tf.keys():
+                df[token] = df.get(token, 0) + 1
+            doc_tokens.append(tokens)
+            doc_tf.append(tf)
+            doc_lengths.append(len(tokens))
+
+        num_docs = len(rows)
+        avgdl = sum(doc_lengths) / max(1, len(doc_lengths))
+        k1 = 1.5
+        b = 0.75
+
+        # Grep-style recall over source files (fast lexical exact-match signal).
+        grep_hits_by_source: Dict[str, int] = {}
+        source_files = []
+        for row in rows:
+            source = str(row.get("source", ""))
+            if source and os.path.isfile(source):
+                source_files.append(source)
+        # De-duplicate while preserving order.
+        source_files = list(dict.fromkeys(source_files))
+        if source_files:
+            grep_terms = [q] + [t for t in terms if t != q][:4]
+            for term in grep_terms:
+                try:
+                    proc = subprocess.run(
+                        ["rg", "-n", "-i", "--no-heading", "-F", term, *source_files],
+                        capture_output=True,
+                        text=True,
+                    )
+                    if proc.returncode not in {0, 1}:
+                        continue
+                    for line in (proc.stdout or "").splitlines():
+                        parts = line.split(":", 2)
+                        if len(parts) < 3:
+                            continue
+                        src = parts[0]
+                        grep_hits_by_source[src] = grep_hits_by_source.get(src, 0) + 1
+                except Exception:
+                    # Keep retrieval resilient when rg is unavailable.
+                    break
+
+        scored: List[Tuple[float, Dict[str, Any]]] = []
+        for idx, row in enumerate(rows):
+            tf = doc_tf[idx]
+            dl = doc_lengths[idx]
+            bm25_score = 0.0
+            for term in terms:
+                f = tf.get(term, 0)
+                n = df.get(term, 0)
+                if f <= 0 or n <= 0:
+                    continue
+                idf = math.log(1.0 + (num_docs - n + 0.5) / (n + 0.5))
+                bm25_score += idf * ((f * (k1 + 1.0)) / (f + k1 * (1.0 - b + b * dl / max(1e-9, avgdl))))
+
+            source = str(row.get("source", ""))
+            grep_hits = grep_hits_by_source.get(source, 0)
+            title_text = str(row.get("title", "")).lower()
+            title_hits = sum(title_text.count(term) for term in terms)
+
+            final_score = bm25_score + 0.35 * grep_hits + 0.15 * title_hits
+            if final_score > 0:
+                scored.append((final_score, row))
+
         scored.sort(key=lambda x: x[0], reverse=True)
-        return [x[1] for x in scored[:top_k]]
+        return [x[1] for x in scored[: max(1, top_k)]]
 
     def _must_namespace(self, namespace: str) -> None:
         if namespace not in self._data:
@@ -1088,14 +1301,95 @@ class DynamicLoopOrchestrator:
     def available(self) -> bool:
         return self.client is not None
 
-    def _get_installed_skills(self) -> List[Dict[str, Any]]:
+    def _extract_lookup_token(self, task: str) -> Optional[str]:
+        text = (task or "").strip()
+        if not text:
+            return None
+        uuid_match = re.search(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b", text)
+        if uuid_match:
+            return uuid_match.group(0)
+        hex_match = re.search(r"\b[0-9a-fA-F]{16,}\b", text)
+        if hex_match:
+            return hex_match.group(0)
+        quoted = re.findall(r"[\"']([^\"']{8,})[\"']", text)
+        for q in quoted:
+            if any(ch.isdigit() for ch in q):
+                return q.strip()
+        return None
+
+    def _rule_based_preplan(self, task: str) -> Optional[Dict[str, Any]]:
+        text = (task or "").strip()
+        if not text:
+            return None
+        low = text.lower()
+        token = self._extract_lookup_token(text)
+        asks_lookup = any(k in low for k in ["find", "search", "locate", "lookup", "where", "contains", "key", "id"])
+        mentions_json = "json" in low
+        if not ((mentions_json and asks_lookup) or (token and asks_lookup)):
+            return None
+
+        query = token or text
+        return {
+            "mode": "EXECUTE",
+            "goal": "Locate target key/value in workspace JSON files.",
+            "success_criteria": ["Return matched files and lines, or clearly state no match found."],
+            "constraints": [],
+            "clarification_question": "",
+            "final_reply": "",
+            "plan": [
+                {
+                    "step": "List JSON files in workspace",
+                    "tool": "list_workspace_files",
+                    "arguments": {"pattern": "*.json", "recursive": True, "limit": 500},
+                },
+                {
+                    "step": "Search key across workspace text",
+                    "tool": "search_workspace_text",
+                    "arguments": {"query": query, "top_k": 80},
+                },
+            ],
+        }
+
+    def _get_installed_skills(self) -> List[str]:
         if "skill_list_installed" not in self.tools.tools:
             return []
         try:
             row = self.tools.execute("skill_list_installed")
             skills = row.get("skills", [])
             if isinstance(skills, list):
-                return [s for s in skills if isinstance(s, dict)][:20]
+                descriptions: List[str] = []
+                for skill in skills:
+                    if not isinstance(skill, dict):
+                        continue
+                    name = str(skill.get("name", "unknown_skill")).strip() or "unknown_skill"
+                    repo = str(skill.get("repo_url", "")).strip()
+                    ref = str(skill.get("ref", "")).strip()
+                    path = str(skill.get("path", "")).strip()
+                    desc = f"{name}: installed skill"
+                    if repo:
+                        desc += f" from {repo}"
+                    if ref:
+                        desc += f" (ref={ref})"
+                    skill_md = ""
+                    if path:
+                        p = Path(path) / "SKILL.md"
+                        if p.exists() and p.is_file():
+                            try:
+                                raw = p.read_text(encoding="utf-8", errors="ignore")
+                                for line in raw.splitlines():
+                                    line = line.strip()
+                                    if not line:
+                                        continue
+                                    if line.startswith("#"):
+                                        continue
+                                    skill_md = line
+                                    break
+                            except Exception:
+                                pass
+                    if skill_md:
+                        desc += f". {truncate_text(skill_md, max_chars=160)}"
+                    descriptions.append(desc)
+                return descriptions[:20]
         except Exception:
             return []
         return []
@@ -1210,6 +1504,47 @@ class DynamicLoopOrchestrator:
                     "final_reply": "",
                     "plan": plan,
                 }
+            if intent == "CODE_TASK":
+                code_path = explicit.get("code_path")
+                command = explicit.get("command")
+                find_text = explicit.get("find_text")
+                replace_text = explicit.get("replace_text")
+                replace_count = explicit.get("count", 1)
+                plan = []
+                if code_path:
+                    plan.append({"step": "Read target code file", "tool": "read_code_file", "arguments": {"path": code_path}})
+                if code_path and isinstance(find_text, str) and isinstance(replace_text, str):
+                    plan.append(
+                        {
+                            "step": "Apply deterministic text replacement",
+                            "tool": "replace_text_in_file",
+                            "arguments": {
+                                "path": code_path,
+                                "find_text": find_text,
+                                "replace_text": replace_text,
+                                "count": replace_count,
+                            },
+                        }
+                    )
+                if command:
+                    plan.append(
+                        {
+                            "step": "Run workspace command",
+                            "tool": "run_shell_command",
+                            "arguments": {"command": command, "timeout_s": 90},
+                        }
+                    )
+                if not plan:
+                    plan.append({"step": "Search related code context", "tool": "search_workspace_text", "arguments": {"query": task, "top_k": 20}})
+                return {
+                    "mode": "EXECUTE",
+                    "goal": "Execute code-focused task in workspace and return actionable output.",
+                    "success_criteria": ["Provide concrete findings or run result for the code task."],
+                    "constraints": [],
+                    "clarification_question": "",
+                    "final_reply": "",
+                    "plan": plan,
+                }
             return {
                 "mode": "CHAT",
                 "goal": "Provide a helpful response.",
@@ -1235,6 +1570,38 @@ class DynamicLoopOrchestrator:
                 ],
             }
 
+        inferred_spreadsheet_path = resolve_spreadsheet_path_from_text(task, workspace=str(self.workspace))
+        if inferred_spreadsheet_path:
+            return {
+                "mode": "EXECUTE",
+                "goal": f"Read and analyze tabular data from {inferred_spreadsheet_path}.",
+                "success_criteria": ["Provide dataset structure and quick data profile."],
+                "constraints": [],
+                "clarification_question": "",
+                "final_reply": "",
+                "plan": [
+                    {
+                        "step": "Write and run Python analyzer for tabular file",
+                        "tool": "analyze_tabular_with_python",
+                        "arguments": {"path": inferred_spreadsheet_path, "max_rows": 200},
+                    },
+                ],
+            }
+
+        inferred_code_path = resolve_code_path_from_text(task, workspace=str(self.workspace))
+        if inferred_code_path:
+            return {
+                "mode": "EXECUTE",
+                "goal": f"Analyze and update code task on {inferred_code_path} in workspace.",
+                "success_criteria": ["Provide code-focused findings or action result."],
+                "constraints": [],
+                "clarification_question": "",
+                "final_reply": "",
+                "plan": [
+                    {"step": "Read code file", "tool": "read_code_file", "arguments": {"path": inferred_code_path}},
+                ],
+            }
+
         return {
             "mode": "CHAT",
             "goal": "Clarify user objective before execution.",
@@ -1245,14 +1612,18 @@ class DynamicLoopOrchestrator:
             ),
             "final_reply": (
                 "I can run a dynamic loop: understand your goal, plan steps, call tools, observe results, and iterate. "
-                "I can work with knowledge lookup, document reading, CSV/data profiling, ML workflow blocks, report generation, and skill installation. "
+                "I can work with knowledge lookup, document reading, CSV/XLSX data profiling, code analysis/edit/test actions, ML workflow blocks, report generation, and skill installation. "
                 "Tell me the concrete task and any file/data path."
             ),
             "plan": [],
         }
 
     def understand_goal(self, task: str, recent_messages: List[Dict[str, Any]]) -> Dict[str, Any]:
-        installed_skills = self._get_installed_skills()
+        rule_plan = self._rule_based_preplan(task)
+        if rule_plan:
+            return rule_plan
+
+        skill_descriptions = self._get_installed_skills()
         recent_experiences = self.memory.recent_experiences(limit=5)
         system_prompt = (
             "You are the Goal Understanding module. "
@@ -1264,7 +1635,7 @@ class DynamicLoopOrchestrator:
             "task": task,
             "recent_messages": recent_messages[-8:],
             "tool_catalog": self.tools.catalog_for_planner(),
-            "installed_skills": installed_skills,
+            "skill_descriptions": skill_descriptions,
             "recent_experiences": recent_experiences,
             "output_schema": {
                 "mode": "CHAT | EXECUTE",
@@ -1285,7 +1656,8 @@ class DynamicLoopOrchestrator:
                 "Use EXECUTE when tool calling is needed; use CHAT for pure discussion or clarification.",
                 "Plan must be dynamic and task-specific. Avoid fixed template plans.",
                 "Only use tools from tool_catalog.",
-                "If installed_skills are relevant, reflect that in plan steps.",
+                "Use skill_descriptions as capability hints only; do not invent unavailable tools.",
+                "If skill_descriptions are relevant, reflect that in plan steps.",
                 "If recent_experiences are relevant, reuse successful tool chains and avoid known failure patterns.",
                 "If information is insufficient, set mode=CHAT and ask one focused clarification.",
             ],
@@ -1468,6 +1840,239 @@ class DynamicLoopOrchestrator:
             "clarification_question": clarification_question,
         }
 
+    def _extract_path_argument(self, args: Dict[str, Any]) -> Optional[str]:
+        for key in ["path", "file_path", "source_path"]:
+            value = args.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
+    def _classify_tool_failure(self, tool_name: str, args: Dict[str, Any], error: str) -> str:
+        err = (error or "").strip().lower()
+        if not err:
+            return "unknown"
+        if "tool not found" in err:
+            return "tool_missing"
+        if "blocked by policy" in err or "blocked by safety rule" in err:
+            return "policy_block"
+        if "file not found" in err or "no such file" in err:
+            return "missing_input"
+        if "timed out" in err or "timeout" in err:
+            return "timeout"
+        if "failed to parse" in err or "unsupported" in err or "not a zip file" in err:
+            return "parse_error"
+        if tool_name == "run_shell_command" and ("command not found" in err or "not found" in err):
+            return "command_missing"
+        if "json" in err:
+            return "json_error"
+        return "unknown"
+
+    def _inject_recovery_steps(
+        self,
+        loop_state: Dict[str, Any],
+        steps: List[Dict[str, Any]],
+        reason: str,
+        iteration: int,
+    ) -> None:
+        if not steps:
+            return
+        plan = list(loop_state.get("plan", []))
+        cursor = int(loop_state.get("plan_cursor", 0))
+        insertion_index = min(len(plan), cursor + 1)
+        normalized: List[Dict[str, Any]] = []
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            tool = str(step.get("tool", "")).strip()
+            if not tool or tool not in self.tools.tools:
+                continue
+            normalized.append(
+                {
+                    "step": str(step.get("step", "Recovery action")).strip() or "Recovery action",
+                    "tool": tool,
+                    "arguments": ensure_dict(step.get("arguments", {})),
+                }
+            )
+        if not normalized:
+            return
+        plan[insertion_index:insertion_index] = normalized
+        loop_state["plan"] = plan[:48]
+        reflections = loop_state.setdefault("reflections", [])
+        reflections.append(
+            {
+                "iteration": iteration,
+                "reason": reason,
+                "inserted_steps": [row.get("step", "") for row in normalized],
+            }
+        )
+
+    def _build_recovery_steps(
+        self,
+        task: str,
+        tool_name: str,
+        args: Dict[str, Any],
+        category: str,
+        error: str,
+    ) -> List[Dict[str, Any]]:
+        steps: List[Dict[str, Any]] = []
+        path = self._extract_path_argument(args)
+        token = self._extract_lookup_token(task)
+        path_obj: Optional[Path] = None
+        if path:
+            try:
+                p = Path(path).expanduser()
+                if not p.is_absolute():
+                    p = (self.workspace / p).resolve()
+                else:
+                    p = p.resolve()
+                path_obj = p
+            except Exception:
+                path_obj = None
+
+        if category == "missing_input":
+            pattern = "*"
+            if path_obj is not None and path_obj.suffix:
+                pattern = f"*{path_obj.suffix.lower()}"
+            steps.append(
+                {
+                    "step": "Discover candidate files in workspace",
+                    "tool": "list_workspace_files",
+                    "arguments": {"pattern": pattern, "recursive": True, "limit": 300},
+                }
+            )
+            if token:
+                steps.append(
+                    {
+                        "step": "Search target token across workspace text",
+                        "tool": "search_workspace_text",
+                        "arguments": {"query": token, "top_k": 80},
+                    }
+                )
+            return steps
+
+        if category == "parse_error":
+            if path_obj is not None and path_obj.suffix.lower() in {".xlsx", ".csv"} and tool_name != "analyze_tabular_with_python":
+                steps.append(
+                    {
+                        "step": "Run robust Python tabular analyzer",
+                        "tool": "analyze_tabular_with_python",
+                        "arguments": {"path": str(path_obj), "max_rows": 300},
+                    }
+                )
+                return steps
+            if path_obj is not None and path_obj.suffix.lower() == ".json":
+                if token:
+                    steps.append(
+                        {
+                            "step": "Search token in JSON/text content",
+                            "tool": "search_workspace_text",
+                            "arguments": {"query": token, "top_k": 80},
+                        }
+                    )
+                else:
+                    steps.append(
+                        {
+                            "step": "Read raw text file for manual parse fallback",
+                            "tool": "read_text_file",
+                            "arguments": {"path": str(path_obj), "max_chars": 50000},
+                        }
+                    )
+                return steps
+
+        if category == "json_error":
+            if token:
+                steps.append(
+                    {
+                        "step": "Search target token across workspace",
+                        "tool": "search_workspace_text",
+                        "arguments": {"query": token, "top_k": 80},
+                    }
+                )
+            return steps
+
+        if category == "timeout" and tool_name == "run_shell_command":
+            command = str(args.get("command", "")).strip()
+            if command:
+                timeout_s = int(args.get("timeout_s", 90) or 90)
+                steps.append(
+                    {
+                        "step": "Retry shell command with larger timeout",
+                        "tool": "run_shell_command",
+                        "arguments": {"command": command, "timeout_s": min(300, max(120, timeout_s * 2))},
+                    }
+                )
+            return steps
+
+        if category == "command_missing" and tool_name == "run_shell_command":
+            command = str(args.get("command", "")).strip()
+            if command.startswith("pip "):
+                steps.append(
+                    {
+                        "step": "Retry package command through python module",
+                        "tool": "run_shell_command",
+                        "arguments": {"command": command.replace("pip ", "python3 -m pip ", 1), "timeout_s": 120},
+                    }
+                )
+            return steps
+
+        if token and any(k in (task or "").lower() for k in ["find", "search", "json", "key", "id"]):
+            steps.append(
+                {
+                    "step": "Search target token across workspace",
+                    "tool": "search_workspace_text",
+                    "arguments": {"query": token, "top_k": 80},
+                }
+            )
+        return steps
+
+    def _reflect_and_recover(
+        self,
+        loop_state: Dict[str, Any],
+        iteration: int,
+        task: str,
+        tool_name: str,
+        args: Dict[str, Any],
+        ok: bool,
+        error: str,
+    ) -> Dict[str, Any]:
+        if ok:
+            return {"action": "continue", "reason": "ok"}
+
+        category = self._classify_tool_failure(tool_name=tool_name, args=args, error=error)
+        stats = loop_state.setdefault("recovery_stats", {})
+        key = f"{tool_name}:{category}"
+        attempts = int(stats.get(key, 0)) + 1
+        stats[key] = attempts
+
+        if category == "policy_block":
+            return {
+                "action": "clarify",
+                "reason": category,
+                "reply": "This action is blocked by policy. Approve the risky action or choose a lower-risk alternative.",
+            }
+
+        if attempts > 3:
+            return {
+                "action": "clarify",
+                "reason": category,
+                "reply": (
+                    f"Recovery attempts exhausted for `{tool_name}` ({category}). "
+                    "Please provide one additional constraint (path, expected output, or allowed tool)."
+                ),
+            }
+
+        steps = self._build_recovery_steps(task=task, tool_name=tool_name, args=args, category=category, error=error)
+        if steps:
+            self._inject_recovery_steps(
+                loop_state=loop_state,
+                steps=steps,
+                reason=f"{category}:{truncate_text(error, max_chars=120)}",
+                iteration=iteration,
+            )
+            return {"action": "replan", "reason": category, "inserted": len(steps)}
+
+        return {"action": "continue", "reason": category}
+
     def _compose_final_answer(self, loop_state: Dict[str, Any]) -> str:
         observations = loop_state.get("observations", [])
         if not observations:
@@ -1497,6 +2102,14 @@ class DynamicLoopOrchestrator:
                 last_ok = row
                 break
         if not last_ok:
+            last_err = None
+            for row in reversed(observations):
+                err = str(row.get("error", "")).strip()
+                if err:
+                    last_err = err
+                    break
+            if last_err:
+                return f"Execution finished with errors. Last error: {last_err}"
             return "Execution finished with errors. Please refine the goal or provide missing inputs."
         result = last_ok.get("result", {})
         if isinstance(result, dict):
@@ -1570,6 +2183,8 @@ class DynamicLoopOrchestrator:
             "executed_tools": [],
             "status": "running",
             "events": [start_event],
+            "reflections": [],
+            "recovery_stats": {},
         }
 
         max_iterations = 12
@@ -1600,6 +2215,7 @@ class DynamicLoopOrchestrator:
                     "plan": [row.get("step", "") for row in loop_state.get("plan", [])],
                     "executed_tools": loop_state["executed_tools"],
                     "observations": loop_state["observations"][-8:],
+                    "reflections": loop_state.get("reflections", [])[-8:],
                     "result_summary": answer,
                     "trace_id": trace_id,
                     "event_log_tail": self.memory.get_workflow_events(trace_id, limit=20),
@@ -1732,11 +2348,43 @@ class DynamicLoopOrchestrator:
             call_sig = f"{tool_name}:{json.dumps(args, ensure_ascii=False, sort_keys=True)}"
             repeated_calls[call_sig] = repeated_calls.get(call_sig, 0) + 1
             if repeated_calls[call_sig] > 2:
+                last_error = ""
+                for row in reversed(loop_state.get("observations", [])):
+                    if str(row.get("tool", "")) == tool_name and str(row.get("error", "")).strip():
+                        last_error = str(row.get("error", "")).strip()
+                        break
+                recovery = self._reflect_and_recover(
+                    loop_state=loop_state,
+                    iteration=iteration,
+                    task=task,
+                    tool_name=tool_name,
+                    args=args,
+                    ok=False,
+                    error=last_error or "repeated_failing_call",
+                )
+                loop_state["events"].append(
+                    self._record_event(
+                        trace_id,
+                        "reflect",
+                        {
+                            "iteration": iteration,
+                            "tool": tool_name,
+                            "reason": recovery.get("reason", "repeat_guard"),
+                            "action": recovery.get("action", "continue"),
+                        },
+                    )
+                )
+                if recovery.get("action") == "replan":
+                    loop_state["plan_cursor"] = int(loop_state.get("plan_cursor", 0)) + 1
+                    continue
                 loop_state["status"] = "clarification_needed"
                 self._record_event(trace_id, "finish", {"status": "repeat_guard", "iteration": iteration, "tool": tool_name})
+                reply = str(recovery.get("reply", "")).strip() or (
+                    "I am repeating the same failing action. Please provide one more constraint so I can recover."
+                )
                 response = {
                     "intent": "GENERAL_CHAT",
-                    "reply": "I am repeating the same failing action. Please provide an additional constraint or expected output format.",
+                    "reply": reply,
                     "suggestions": DEFAULT_CLARIFICATION_SUGGESTIONS,
                     "planner_mode": "REPEAT_GUARD",
                     "goal": loop_state["goal"],
@@ -1802,6 +2450,50 @@ class DynamicLoopOrchestrator:
                     },
                 )
             )
+            recovery = self._reflect_and_recover(
+                loop_state=loop_state,
+                iteration=iteration,
+                task=task,
+                tool_name=tool_name,
+                args=args,
+                ok=ok,
+                error=str(error or ""),
+            )
+            loop_state["events"].append(
+                self._record_event(
+                    trace_id,
+                    "reflect",
+                    {
+                        "iteration": iteration,
+                        "tool": tool_name,
+                        "ok": ok,
+                        "reason": recovery.get("reason", ""),
+                        "action": recovery.get("action", "continue"),
+                    },
+                )
+            )
+            if recovery.get("action") == "clarify":
+                loop_state["status"] = "clarification_needed"
+                self._record_event(trace_id, "finish", {"status": "clarify_after_reflect", "iteration": iteration})
+                response = {
+                    "intent": "GENERAL_CHAT",
+                    "reply": str(recovery.get("reply", "")).strip()
+                    or "Please provide one additional constraint so I can continue.",
+                    "suggestions": DEFAULT_CLARIFICATION_SUGGESTIONS,
+                    "planner_mode": "REFLECT_CLARIFY",
+                    "goal": loop_state["goal"],
+                    "trace_id": trace_id,
+                    "event_log_tail": self.memory.get_workflow_events(trace_id, limit=20),
+                }
+                self._capture_experience(
+                    session_id=session_id,
+                    trace_id=trace_id,
+                    task=task,
+                    response=response,
+                    loop_state=loop_state,
+                )
+                return response
+
             loop_state["plan_cursor"] = int(loop_state.get("plan_cursor", 0)) + 1
 
         loop_state["status"] = "max_iterations"
@@ -1813,6 +2505,7 @@ class DynamicLoopOrchestrator:
             "plan": [row.get("step", "") for row in loop_state.get("plan", [])],
             "executed_tools": loop_state["executed_tools"],
             "observations": loop_state["observations"][-8:],
+            "reflections": loop_state.get("reflections", [])[-8:],
             "result_summary": self._compose_final_answer(loop_state),
             "trace_id": trace_id,
             "event_log_tail": self.memory.get_workflow_events(trace_id, limit=20),
@@ -1846,6 +2539,11 @@ class IntentRouterAgent(BaseAgent):
         task_domain = understanding.get("task_domain", "general")
         supported_execution = bool(understanding.get("supported_execution", True))
         file_path = understanding.get("file_path")
+        code_path = understanding.get("code_path")
+        command = understanding.get("command")
+        find_text = understanding.get("find_text")
+        replace_text = understanding.get("replace_text")
+        replace_count = understanding.get("count", 1)
 
         if intent == "GENERAL_CHAT" or mode != "EXECUTE":
             state["intent"] = intent
@@ -1883,6 +2581,14 @@ class IntentRouterAgent(BaseAgent):
             receiver = "doc_summarizer"
             route_mode = "direct_summary"
             return_to = "user"
+        elif intent == "CODE_TASK" and needs_knowledge:
+            receiver = "kb_retriever"
+            route_mode = "enrich_workflow"
+            return_to = "planner"
+        elif intent == "CODE_TASK":
+            receiver = "planner"
+            route_mode = "direct_code"
+            return_to = "planner"
         elif intent == "KNOWLEDGE_LOOKUP":
             receiver = "kb_retriever"
             route_mode = "direct_answer"
@@ -1903,6 +2609,11 @@ class IntentRouterAgent(BaseAgent):
         state["router_mode"] = mode
         state["task_domain"] = task_domain
         state["supported_execution"] = supported_execution
+        state["code_path"] = code_path
+        state["command"] = command
+        state["find_text"] = find_text
+        state["replace_text"] = replace_text
+        state["count"] = replace_count
         state["requirements"] = requirements
         return {
             "sender": self.name,
@@ -1916,6 +2627,11 @@ class IntentRouterAgent(BaseAgent):
                 "route_mode": route_mode,
                 "return_to": return_to,
                 "file_path": file_path,
+                "code_path": code_path,
+                "command": command,
+                "find_text": find_text,
+                "replace_text": replace_text,
+                "count": replace_count,
                 "requirements": requirements,
                 "router_confidence": confidence,
                 "router_source": understanding.get("source", "unknown"),
@@ -1937,6 +2653,12 @@ class KBRetrieverAgent(BaseAgent):
         intent = message["content"].get("intent", "KNOWLEDGE_LOOKUP")
         route_mode = message["content"].get("route_mode", "direct_answer")
         return_to = message["content"].get("return_to", "user")
+        file_path = message["content"].get("file_path")
+        code_path = message["content"].get("code_path")
+        command = message["content"].get("command")
+        find_text = message["content"].get("find_text")
+        replace_text = message["content"].get("replace_text")
+        replace_count = message["content"].get("count", 1)
         requirements = message["content"].get("requirements")
         router_confidence = message["content"].get("router_confidence", 0.0)
         router_source = message["content"].get("router_source", "unknown")
@@ -1955,6 +2677,12 @@ class KBRetrieverAgent(BaseAgent):
                     "intent": intent,
                     "knowledge_context": snippets,
                     "needs_knowledge": True,
+                    "file_path": file_path,
+                    "code_path": code_path,
+                    "command": command,
+                    "find_text": find_text,
+                    "replace_text": replace_text,
+                    "count": replace_count,
                     "requirements": requirements,
                     "router_confidence": router_confidence,
                     "router_source": router_source,
@@ -2050,12 +2778,62 @@ class PlannerAgent(BaseAgent):
 
     def handle(self, message: Message, state: State) -> Message:
         task = message["content"]["task"]
+        intent = str(message["content"].get("intent", state.get("intent", "ML_WORKFLOW"))).upper()
         knowledge_context = message["content"].get("knowledge_context", state.get("knowledge_context", []))
-        incoming_requirements = message["content"].get("requirements")
-        requirements = normalize_requirements(incoming_requirements, task)
-        steps = build_dynamic_workflow_steps(requirements)
+        requirements: Dict[str, Any] = {}
+        code_path = message["content"].get("code_path", state.get("code_path"))
+        command = message["content"].get("command", state.get("command"))
+        find_text = message["content"].get("find_text", state.get("find_text"))
+        replace_text = message["content"].get("replace_text", state.get("replace_text"))
+        replace_count = message["content"].get("count", state.get("count", 1))
+        if intent == "CODE_TASK":
+            steps: List[Dict[str, Any]] = []
+            if code_path:
+                steps.append(
+                    {
+                        "kind": "code_read",
+                        "agent": "code_agent",
+                        "name": "Read target code file",
+                        "code_path": code_path,
+                    }
+                )
+            if code_path and isinstance(find_text, str) and isinstance(replace_text, str):
+                steps.append(
+                    {
+                        "kind": "code_patch",
+                        "agent": "code_agent",
+                        "name": "Apply deterministic code patch",
+                        "code_path": code_path,
+                        "find_text": find_text,
+                        "replace_text": replace_text,
+                        "count": replace_count,
+                    }
+                )
+            if command:
+                steps.append(
+                    {
+                        "kind": "code_execute",
+                        "agent": "code_agent",
+                        "name": "Run workspace command",
+                        "command": command,
+                    }
+                )
+            if not steps:
+                steps.append(
+                    {
+                        "kind": "code_task",
+                        "agent": "code_agent",
+                        "name": "Inspect codebase for requested task",
+                    }
+                )
+            state["requirements"] = {}
+        else:
+            incoming_requirements = message["content"].get("requirements")
+            requirements = normalize_requirements(incoming_requirements, task)
+            steps = build_dynamic_workflow_steps(requirements)
+            state["requirements"] = requirements
 
-        state["requirements"] = requirements
+        state["workflow_intent"] = intent
         state["workflow_plan"] = steps
         state["workflow_cursor"] = 0
         state["workflow_task"] = task
@@ -2068,11 +2846,17 @@ class PlannerAgent(BaseAgent):
             "type": "workflow_plan_ready",
             "priority": 70,
             "content": {
+                "intent": intent,
                 "task": task,
                 "plan": state["plan"],
                 "steps": steps,
                 "requirements": requirements,
                 "knowledge_context": knowledge_context,
+                "code_path": code_path,
+                "command": command,
+                "find_text": find_text,
+                "replace_text": replace_text,
+                "count": replace_count,
             },
             "metadata": {"trace_id": state["trace_id"]},
         }
@@ -2086,7 +2870,13 @@ class WorkflowControllerAgent(BaseAgent):
         msg_type = message["type"]
         if msg_type == "workflow_plan_ready":
             state["workflow_cursor"] = 0
+            state["workflow_intent"] = message["content"].get("intent", state.get("intent", "ML_WORKFLOW"))
             state["workflow_task"] = message["content"]["task"]
+            state["code_path"] = message["content"].get("code_path", state.get("code_path"))
+            state["command"] = message["content"].get("command", state.get("command"))
+            state["find_text"] = message["content"].get("find_text", state.get("find_text"))
+            state["replace_text"] = message["content"].get("replace_text", state.get("replace_text"))
+            state["count"] = message["content"].get("count", state.get("count", 1))
             state.setdefault("artifacts", {})
             state.setdefault("executed_steps", [])
         elif msg_type == "step_done":
@@ -2110,9 +2900,48 @@ class WorkflowControllerAgent(BaseAgent):
         steps: List[Dict[str, Any]] = state.get("workflow_plan", [])
         cursor = state.get("workflow_cursor", 0)
         task = state.get("workflow_task", message["content"].get("task", ""))
+        workflow_intent = str(state.get("workflow_intent", state.get("intent", "ML_WORKFLOW"))).upper()
 
         if cursor >= len(steps):
             artifacts = state.get("artifacts", {})
+            if workflow_intent == "CODE_TASK":
+                command_result = artifacts.get("command_result", {})
+                code_context = artifacts.get("code_context", {})
+                code_search = artifacts.get("code_search", {})
+                patch_result = artifacts.get("patch_result", {})
+                summary_parts = ["Code task completed."]
+                if isinstance(command_result, dict):
+                    rc = command_result.get("return_code")
+                    if rc is not None:
+                        summary_parts.append(f"Command return code: {rc}.")
+                if isinstance(patch_result, dict) and patch_result.get("ok"):
+                    summary_parts.append(f"Applied replacements: {patch_result.get('replacements', 0)}.")
+                if isinstance(code_context, dict) and code_context.get("path"):
+                    summary_parts.append(f"Code file analyzed: {code_context.get('path')}.")
+                if isinstance(code_search, dict) and code_search.get("count"):
+                    summary_parts.append(f"Code search matches: {code_search.get('count')}.")
+                return {
+                    "sender": self.name,
+                    "receiver": "user",
+                    "type": "final_result",
+                    "priority": 80,
+                    "content": {
+                        "intent": "CODE_TASK",
+                        "summary": " ".join(summary_parts),
+                        "executed_steps": state.get("executed_steps", []),
+                        "code_path": state.get("code_path"),
+                        "command": state.get("command"),
+                        "find_text": state.get("find_text"),
+                        "replace_text": state.get("replace_text"),
+                        "count": state.get("count", 1),
+                        "command_result": command_result,
+                        "patch_result": patch_result,
+                        "code_context": code_context,
+                        "code_search": code_search,
+                    },
+                    "metadata": {"trace_id": state["trace_id"]},
+                }
+
             evaluation_result = artifacts.get("evaluation_result", {})
             report = artifacts.get("report", {})
             metrics = evaluation_result.get("all_metrics", report.get("metrics", []))
@@ -2135,7 +2964,7 @@ class WorkflowControllerAgent(BaseAgent):
                 "type": "final_result",
                 "priority": 80,
                 "content": {
-                    "intent": "ML_WORKFLOW",
+                    "intent": workflow_intent if workflow_intent else "ML_WORKFLOW",
                     "summary": "Dynamic ML workflow finished based on user requirements.",
                     "executed_steps": state.get("executed_steps", []),
                     "requirements": state.get("requirements", {}),
@@ -2156,9 +2985,15 @@ class WorkflowControllerAgent(BaseAgent):
             "priority": 68,
             "content": {
                 "task": task,
+                "intent": workflow_intent,
                 "step": next_step,
                 "requirements": state.get("requirements", {}),
                 "knowledge_context": state.get("knowledge_context", []),
+                "code_path": state.get("code_path"),
+                "command": state.get("command"),
+                "find_text": state.get("find_text"),
+                "replace_text": state.get("replace_text"),
+                "count": state.get("count", 1),
                 "artifacts": state.get("artifacts", {}),
             },
             "metadata": {"trace_id": state["trace_id"]},
@@ -2352,6 +3187,78 @@ class ReporterAgent(BaseAgent):
         }
 
 
+class CodeAgent(BaseAgent):
+    def __init__(self, tools: ToolRegistry):
+        super().__init__("code_agent")
+        self.tools = tools
+
+    def handle(self, message: Message, state: State) -> Message:
+        step = message["content"].get("step", {"kind": "code_task"})
+        step_kind = str(step.get("kind", "code_task"))
+        task = message["content"]["task"]
+        artifacts = message["content"].get("artifacts", {})
+        code_path = step.get("code_path") or message["content"].get("code_path")
+        command = step.get("command") or message["content"].get("command")
+        updates: Dict[str, Any] = {}
+
+        if step_kind == "code_read":
+            if code_path:
+                updates["code_context"] = self.tools.execute("read_code_file", path=code_path, max_chars=50000)
+            else:
+                updates["code_search"] = self.tools.execute("search_workspace_text", query=task, top_k=20)
+        elif step_kind == "code_execute":
+            if command:
+                timeout_s = int(step.get("timeout_s", 90) or 90)
+                updates["command_result"] = self.tools.execute(
+                    "run_shell_command",
+                    command=command,
+                    timeout_s=timeout_s,
+                )
+            else:
+                updates["command_result"] = {"ok": False, "error": "command is required for code_execute"}
+        else:
+            # Generic code task: optionally read code, apply deterministic patch, then run command.
+            if code_path:
+                updates["code_context"] = self.tools.execute("read_code_file", path=code_path, max_chars=50000)
+
+            find_text = step.get("find_text")
+            replace_text = step.get("replace_text")
+            if code_path and isinstance(find_text, str) and isinstance(replace_text, str):
+                updates["patch_result"] = self.tools.execute(
+                    "replace_text_in_file",
+                    path=code_path,
+                    find_text=find_text,
+                    replace_text=replace_text,
+                    count=int(step.get("count", 1) or 1),
+                )
+
+            if command:
+                updates["command_result"] = self.tools.execute(
+                    "run_shell_command",
+                    command=command,
+                    timeout_s=int(step.get("timeout_s", 90) or 90),
+                )
+
+            if not updates:
+                updates["code_search"] = self.tools.execute("search_workspace_text", query=task, top_k=20)
+
+        if "command_result" in updates:
+            state["command_result"] = updates["command_result"]
+
+        return {
+            "sender": self.name,
+            "receiver": "workflow_controller",
+            "type": "step_done",
+            "priority": 64,
+            "content": {
+                "task": task,
+                "step": step,
+                "artifact_updates": updates,
+            },
+            "metadata": {"trace_id": state["trace_id"]},
+        }
+
+
 class Supervisor:
     def __init__(self, agents: Dict[str, BaseAgent]):
         self.agents = agents
@@ -2386,6 +3293,12 @@ def build_tool_registry(memory: MemoryStore, workspace: str) -> ToolRegistry:
     tools = ToolRegistry()
     skill_store = SkillStore(root=os.path.join(workspace, ".skills"))
     workspace_path = Path(workspace).expanduser().resolve()
+
+    def resolve_workspace_file(path: str) -> Path:
+        p = Path(path).expanduser()
+        if not p.is_absolute():
+            p = workspace_path / p
+        return p.resolve()
 
     def kb_search(query: str, top_k: int = 5) -> Dict[str, Any]:
         hits = memory.search("knowledge", query=query, top_k=top_k)
@@ -2473,10 +3386,7 @@ def build_tool_registry(memory: MemoryStore, workspace: str) -> ToolRegistry:
     def read_csv_preview(path: str, max_rows: int = 20) -> Dict[str, Any]:
         if not path:
             return {"ok": False, "error": "path is required"}
-        p = Path(path).expanduser()
-        if not p.is_absolute():
-            p = workspace_path / p
-        p = p.resolve()
+        p = resolve_workspace_file(path)
         if not p.exists() or not p.is_file():
             return {"ok": False, "error": f"file not found: {p}"}
         rows: List[Dict[str, Any]] = []
@@ -2489,8 +3399,188 @@ def build_tool_registry(memory: MemoryStore, workspace: str) -> ToolRegistry:
                 rows.append(dict(row))
         return {"ok": True, "path": str(p), "headers": headers, "rows": rows, "row_count": len(rows)}
 
-    def profile_csv_columns(path: str, max_rows: int = 500) -> Dict[str, Any]:
-        preview = read_csv_preview(path=path, max_rows=max_rows)
+    def _xlsx_col_idx(cell_ref: str, fallback_idx: int) -> int:
+        m = re.match(r"([A-Z]+)", (cell_ref or "").upper())
+        if not m:
+            return fallback_idx
+        letters = m.group(1)
+        value = 0
+        for ch in letters:
+            value = value * 26 + (ord(ch) - ord("A") + 1)
+        return max(0, value - 1)
+
+    def _xlsx_shared_strings(zf: zipfile.ZipFile) -> List[str]:
+        if "xl/sharedStrings.xml" not in zf.namelist():
+            return []
+        ns = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+        try:
+            root = ET.fromstring(zf.read("xl/sharedStrings.xml"))
+        except Exception:
+            return []
+        out: List[str] = []
+        for si in root.findall("m:si", ns):
+            texts = []
+            for t in si.findall(".//m:t", ns):
+                texts.append(t.text or "")
+            out.append("".join(texts))
+        return out
+
+    def _xlsx_sheet_target(zf: zipfile.ZipFile, sheet_name: Optional[str]) -> Tuple[Optional[str], Optional[str], List[str]]:
+        ns_wb = {
+            "m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+            "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+        }
+        ns_rel = {"p": "http://schemas.openxmlformats.org/package/2006/relationships"}
+        try:
+            wb = ET.fromstring(zf.read("xl/workbook.xml"))
+            rels = ET.fromstring(zf.read("xl/_rels/workbook.xml.rels"))
+        except Exception:
+            return None, None, []
+
+        id_to_target: Dict[str, str] = {}
+        for rel in rels.findall("p:Relationship", ns_rel):
+            rid = rel.attrib.get("Id", "")
+            target = rel.attrib.get("Target", "")
+            if rid and target:
+                id_to_target[rid] = target
+
+        sheets: List[Tuple[str, str]] = []
+        for s in wb.findall("m:sheets/m:sheet", ns_wb):
+            name = s.attrib.get("name", "")
+            rid = s.attrib.get(f"{{{ns_wb['r']}}}id", "")
+            if name and rid:
+                sheets.append((name, rid))
+
+        sheet_names = [s[0] for s in sheets]
+        if not sheets:
+            return None, None, sheet_names
+
+        chosen_name, chosen_rid = sheets[0]
+        if sheet_name:
+            for name, rid in sheets:
+                if name.lower() == sheet_name.lower():
+                    chosen_name, chosen_rid = name, rid
+                    break
+        target = id_to_target.get(chosen_rid)
+        if not target:
+            return None, chosen_name, sheet_names
+        target = target.lstrip("/")
+        if not target.startswith("xl/"):
+            target = f"xl/{target}"
+        return target, chosen_name, sheet_names
+
+    def _read_xlsx_preview(path: Path, max_rows: int = 20, sheet_name: Optional[str] = None) -> Dict[str, Any]:
+        try:
+            with zipfile.ZipFile(path, "r") as zf:
+                sheet_target, active_sheet, all_sheets = _xlsx_sheet_target(zf, sheet_name)
+                if not sheet_target or sheet_target not in zf.namelist():
+                    return {"ok": False, "error": "failed to locate worksheet in .xlsx", "path": str(path)}
+                shared_strings = _xlsx_shared_strings(zf)
+                ns = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+                root = ET.fromstring(zf.read(sheet_target))
+        except Exception as e:
+            return {"ok": False, "error": f"failed to parse xlsx: {e}", "path": str(path)}
+
+        parsed_rows: List[Dict[int, Any]] = []
+        for row_elem in root.findall(".//m:sheetData/m:row", ns):
+            row_data: Dict[int, Any] = {}
+            fallback_idx = 0
+            for cell in row_elem.findall("m:c", ns):
+                col_idx = _xlsx_col_idx(cell.attrib.get("r", ""), fallback_idx)
+                fallback_idx = col_idx + 1
+                cell_type = cell.attrib.get("t", "")
+                value: Any = ""
+
+                inline_text = []
+                for t_elem in cell.findall("m:is/m:t", ns):
+                    inline_text.append(t_elem.text or "")
+                if inline_text:
+                    value = "".join(inline_text)
+                else:
+                    v_elem = cell.find("m:v", ns)
+                    raw = (v_elem.text or "") if v_elem is not None else ""
+                    if cell_type == "s":
+                        try:
+                            i = int(raw)
+                            value = shared_strings[i] if 0 <= i < len(shared_strings) else raw
+                        except Exception:
+                            value = raw
+                    elif cell_type == "b":
+                        value = raw == "1"
+                    else:
+                        value = raw
+                row_data[col_idx] = value
+            parsed_rows.append(row_data)
+            if len(parsed_rows) >= max(2, min(max_rows + 1, 1001)):
+                break
+
+        if not parsed_rows:
+            return {
+                "ok": True,
+                "path": str(path),
+                "sheet_name": active_sheet or "",
+                "sheet_names": all_sheets,
+                "headers": [],
+                "rows": [],
+                "row_count": 0,
+            }
+
+        max_col = 0
+        for row in parsed_rows:
+            if row:
+                max_col = max(max_col, max(row.keys()))
+
+        raw_headers = []
+        header_row = parsed_rows[0]
+        for idx in range(max_col + 1):
+            cell_val = str(header_row.get(idx, "")).strip()
+            raw_headers.append(cell_val if cell_val else f"column_{idx+1}")
+
+        dedup_headers: List[str] = []
+        seen: Dict[str, int] = {}
+        for h in raw_headers:
+            base = h
+            if base not in seen:
+                seen[base] = 1
+                dedup_headers.append(base)
+            else:
+                seen[base] += 1
+                dedup_headers.append(f"{base}_{seen[base]}")
+
+        data_rows: List[Dict[str, Any]] = []
+        for row in parsed_rows[1:]:
+            mapped: Dict[str, Any] = {}
+            for idx, h in enumerate(dedup_headers):
+                mapped[h] = row.get(idx, "")
+            data_rows.append(mapped)
+            if len(data_rows) >= max(1, min(max_rows, 1000)):
+                break
+
+        return {
+            "ok": True,
+            "path": str(path),
+            "sheet_name": active_sheet or "",
+            "sheet_names": all_sheets,
+            "headers": dedup_headers,
+            "rows": data_rows,
+            "row_count": len(data_rows),
+        }
+
+    def read_spreadsheet_preview(path: str, max_rows: int = 20, sheet_name: Optional[str] = None) -> Dict[str, Any]:
+        if not path:
+            return {"ok": False, "error": "path is required"}
+        p = resolve_workspace_file(path)
+        if not p.exists() or not p.is_file():
+            return {"ok": False, "error": f"file not found: {p}"}
+        suffix = p.suffix.lower()
+        if suffix == ".csv":
+            return read_csv_preview(path=str(p), max_rows=max_rows)
+        if suffix == ".xlsx":
+            return _read_xlsx_preview(path=p, max_rows=max_rows, sheet_name=sheet_name)
+        return {"ok": False, "error": f"unsupported spreadsheet file type: {suffix}", "path": str(p)}
+
+    def profile_tabular_columns(path: str, max_rows: int = 500, sheet_name: Optional[str] = None) -> Dict[str, Any]:
+        preview = read_spreadsheet_preview(path=path, max_rows=max_rows, sheet_name=sheet_name)
         if not preview.get("ok"):
             return preview
         headers = preview.get("headers", [])
@@ -2517,6 +3607,315 @@ def build_tool_registry(memory: MemoryStore, workspace: str) -> ToolRegistry:
             )
         return {"ok": True, "path": preview.get("path"), "rows_analyzed": len(rows), "column_stats": stats}
 
+    def profile_csv_columns(path: str, max_rows: int = 500) -> Dict[str, Any]:
+        # Backward-compatible alias.
+        return profile_tabular_columns(path=path, max_rows=max_rows)
+
+    def analyze_tabular_with_python(path: str, max_rows: int = 200, timeout_s: int = 120) -> Dict[str, Any]:
+        """
+        Codex-style execution helper:
+        1) write a temporary Python analyzer script
+        2) run it in workspace
+        3) return parsed JSON result
+        """
+        if not path:
+            return {"ok": False, "error": "path is required"}
+        p = resolve_workspace_file(path)
+        if not p.exists() or not p.is_file():
+            return {"ok": False, "error": f"file not found: {p}"}
+
+        tmp_dir = workspace_path / ".tmp"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        script_path = tmp_dir / f"tabular_analyzer_{now_ms()}.py"
+
+        script_code = r'''
+import csv
+import json
+import pathlib
+import re
+import sys
+import zipfile
+import xml.etree.ElementTree as ET
+
+def safe_float(v):
+    try:
+        return float(str(v))
+    except Exception:
+        return None
+
+def profile_rows(headers, rows):
+    stats = []
+    for h in headers:
+        values = [r.get(h, "") for r in rows]
+        non_empty = [v for v in values if str(v).strip() != ""]
+        numeric = 0
+        for v in non_empty:
+            if safe_float(v) is not None:
+                numeric += 1
+        stats.append(
+            {
+                "column": h,
+                "non_empty": len(non_empty),
+                "non_empty_ratio": round(len(non_empty) / max(1, len(rows)), 4),
+                "numeric_ratio": round(numeric / max(1, len(non_empty)), 4),
+                "sample_values": [str(v) for v in non_empty[:5]],
+            }
+        )
+    return stats
+
+def parse_text_table(path, max_rows):
+    text = path.read_text(encoding="utf-8", errors="ignore")
+    lines = text.splitlines()
+    if not lines:
+        return {"headers": [], "rows": [], "row_count": 0, "detected_format": "empty_text"}
+
+    sample = "\n".join(lines[:50])
+    delim_candidates = [",", "\t", ";", "|"]
+    counts = {d: sample.count(d) for d in delim_candidates}
+    delimiter = max(counts, key=counts.get)
+    if counts.get(delimiter, 0) == 0:
+        # Not a real table, return text preview as single-column rows.
+        headers = ["text_line"]
+        rows = [{"text_line": ln} for ln in lines[:max_rows]]
+        return {"headers": headers, "rows": rows, "row_count": len(rows), "detected_format": "plain_text"}
+
+    reader = csv.reader(lines, delimiter=delimiter)
+    parsed = []
+    for idx, row in enumerate(reader):
+        if idx >= max_rows + 1:
+            break
+        parsed.append(row)
+
+    if not parsed:
+        return {"headers": [], "rows": [], "row_count": 0, "detected_format": "delimited_text"}
+
+    raw_headers = [str(x).strip() if str(x).strip() else f"column_{i+1}" for i, x in enumerate(parsed[0])]
+    headers = []
+    seen = {}
+    for h in raw_headers:
+        if h not in seen:
+            seen[h] = 1
+            headers.append(h)
+        else:
+            seen[h] += 1
+            headers.append(f"{h}_{seen[h]}")
+
+    out_rows = []
+    for row in parsed[1:]:
+        mapped = {}
+        for i, h in enumerate(headers):
+            mapped[h] = row[i] if i < len(row) else ""
+        out_rows.append(mapped)
+
+    return {"headers": headers, "rows": out_rows, "row_count": len(out_rows), "detected_format": "delimited_text"}
+
+def xlsx_col_idx(cell_ref, fallback_idx):
+    m = re.match(r"([A-Z]+)", (cell_ref or "").upper())
+    if not m:
+        return fallback_idx
+    letters = m.group(1)
+    value = 0
+    for ch in letters:
+        value = value * 26 + (ord(ch) - ord("A") + 1)
+    return max(0, value - 1)
+
+def parse_xlsx(path, max_rows):
+    ns_wb = {
+        "m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+        "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+    }
+    ns_rel = {"p": "http://schemas.openxmlformats.org/package/2006/relationships"}
+    ns = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+
+    with zipfile.ZipFile(path, "r") as zf:
+        wb = ET.fromstring(zf.read("xl/workbook.xml"))
+        rels = ET.fromstring(zf.read("xl/_rels/workbook.xml.rels"))
+        id_to_target = {}
+        for rel in rels.findall("p:Relationship", ns_rel):
+            rid = rel.attrib.get("Id", "")
+            target = rel.attrib.get("Target", "")
+            if rid and target:
+                id_to_target[rid] = target
+
+        sheets = []
+        for s in wb.findall("m:sheets/m:sheet", ns_wb):
+            name = s.attrib.get("name", "")
+            rid = s.attrib.get(f"{{{ns_wb['r']}}}id", "")
+            if name and rid:
+                sheets.append((name, rid))
+        if not sheets:
+            return {"headers": [], "rows": [], "row_count": 0, "detected_format": "xlsx_empty", "sheet_name": "", "sheet_names": []}
+
+        sheet_name, rid = sheets[0]
+        target = id_to_target.get(rid, "").lstrip("/")
+        if not target.startswith("xl/"):
+            target = f"xl/{target}"
+        root = ET.fromstring(zf.read(target))
+
+        shared_strings = []
+        if "xl/sharedStrings.xml" in zf.namelist():
+            ss_root = ET.fromstring(zf.read("xl/sharedStrings.xml"))
+            for si in ss_root.findall("m:si", ns):
+                texts = []
+                for t in si.findall(".//m:t", ns):
+                    texts.append(t.text or "")
+                shared_strings.append("".join(texts))
+
+        parsed_rows = []
+        for row_elem in root.findall(".//m:sheetData/m:row", ns):
+            row_data = {}
+            fallback_idx = 0
+            for cell in row_elem.findall("m:c", ns):
+                col_idx = xlsx_col_idx(cell.attrib.get("r", ""), fallback_idx)
+                fallback_idx = col_idx + 1
+                cell_type = cell.attrib.get("t", "")
+
+                inline_text = []
+                for t_elem in cell.findall("m:is/m:t", ns):
+                    inline_text.append(t_elem.text or "")
+                if inline_text:
+                    value = "".join(inline_text)
+                else:
+                    v_elem = cell.find("m:v", ns)
+                    raw = (v_elem.text or "") if v_elem is not None else ""
+                    if cell_type == "s":
+                        try:
+                            i = int(raw)
+                            value = shared_strings[i] if 0 <= i < len(shared_strings) else raw
+                        except Exception:
+                            value = raw
+                    elif cell_type == "b":
+                        value = raw == "1"
+                    else:
+                        value = raw
+                row_data[col_idx] = value
+            parsed_rows.append(row_data)
+            if len(parsed_rows) >= max_rows + 1:
+                break
+
+    if not parsed_rows:
+        return {"headers": [], "rows": [], "row_count": 0, "detected_format": "xlsx", "sheet_name": sheet_name, "sheet_names": [s[0] for s in sheets]}
+
+    max_col = 0
+    for row in parsed_rows:
+        if row:
+            max_col = max(max_col, max(row.keys()))
+
+    raw_headers = []
+    header_row = parsed_rows[0]
+    for idx in range(max_col + 1):
+        val = str(header_row.get(idx, "")).strip()
+        raw_headers.append(val if val else f"column_{idx+1}")
+
+    headers = []
+    seen = {}
+    for h in raw_headers:
+        if h not in seen:
+            seen[h] = 1
+            headers.append(h)
+        else:
+            seen[h] += 1
+            headers.append(f"{h}_{seen[h]}")
+
+    rows = []
+    for row in parsed_rows[1:]:
+        mapped = {}
+        for idx, h in enumerate(headers):
+            mapped[h] = row.get(idx, "")
+        rows.append(mapped)
+
+    return {
+        "headers": headers,
+        "rows": rows,
+        "row_count": len(rows),
+        "detected_format": "xlsx",
+        "sheet_name": sheet_name,
+        "sheet_names": [s[0] for s in sheets],
+    }
+
+def main():
+    path = pathlib.Path(sys.argv[1]).expanduser()
+    max_rows = max(1, min(int(sys.argv[2]) if len(sys.argv) > 2 else 200, 2000))
+
+    if not path.exists() or not path.is_file():
+        print(json.dumps({"ok": False, "error": f"file not found: {path}"}, ensure_ascii=False))
+        return
+
+    suffix = path.suffix.lower()
+    payload = {"ok": True, "path": str(path), "suffix": suffix}
+
+    try:
+        if suffix == ".xlsx" and zipfile.is_zipfile(path):
+            parsed = parse_xlsx(path, max_rows=max_rows)
+        else:
+            parsed = parse_text_table(path, max_rows=max_rows)
+        payload.update(parsed)
+        payload["column_stats"] = profile_rows(parsed.get("headers", []), parsed.get("rows", []))
+        payload["summary"] = (
+            f"Analyzed {path.name}: format={payload.get('detected_format')}, "
+            f"rows={payload.get('row_count', 0)}, columns={len(payload.get('headers', []))}."
+        )
+    except Exception as e:
+        payload = {"ok": False, "path": str(path), "error": f"analysis failed: {e}"}
+
+    print(json.dumps(payload, ensure_ascii=False))
+
+if __name__ == "__main__":
+    main()
+'''.lstrip()
+
+        try:
+            script_path.write_text(script_code, encoding="utf-8")
+        except Exception as e:
+            return {"ok": False, "error": f"failed to write analyzer script: {e}"}
+
+        try:
+            proc = subprocess.run(
+                ["python3", str(script_path), str(p), str(max_rows)],
+                cwd=str(workspace_path),
+                capture_output=True,
+                text=True,
+                timeout=max(10, min(int(timeout_s or 120), 300)),
+            )
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "error": "python analyzer timed out", "script_path": str(script_path), "path": str(p)}
+        except Exception as e:
+            return {"ok": False, "error": f"failed to run analyzer script: {e}", "script_path": str(script_path), "path": str(p)}
+
+        stdout = (proc.stdout or "").strip()
+        stderr = (proc.stderr or "").strip()
+        parsed: Optional[Dict[str, Any]] = None
+        for line in reversed(stdout.splitlines()):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                candidate = json.loads(line)
+                if isinstance(candidate, dict):
+                    parsed = candidate
+                    break
+            except Exception:
+                continue
+
+        if parsed is None:
+            return {
+                "ok": False,
+                "error": "analyzer script did not return valid JSON",
+                "path": str(p),
+                "script_path": str(script_path),
+                "return_code": proc.returncode,
+                "stdout": truncate_text(stdout, max_chars=4000),
+                "stderr": truncate_text(stderr, max_chars=4000),
+            }
+
+        parsed["script_path"] = str(script_path)
+        parsed["return_code"] = proc.returncode
+        parsed["stderr"] = truncate_text(stderr, max_chars=2000)
+        if proc.returncode != 0 and parsed.get("ok") is not False:
+            parsed["ok"] = False
+            parsed["error"] = f"python analyzer exited with code {proc.returncode}"
+        return parsed
+
     def write_text_file(path: str, text: str, overwrite: bool = True) -> Dict[str, Any]:
         if not path:
             return {"ok": False, "error": "path is required"}
@@ -2529,6 +3928,109 @@ def build_tool_registry(memory: MemoryStore, workspace: str) -> ToolRegistry:
             return {"ok": False, "error": f"file already exists: {p}"}
         p.write_text(text or "", encoding="utf-8")
         return {"ok": True, "path": str(p), "chars": len(text or "")}
+
+    def read_code_file(path: str, max_chars: int = 50000) -> Dict[str, Any]:
+        if not path:
+            return {"ok": False, "error": "path is required"}
+        p = resolve_workspace_file(path)
+        if not p.exists() or not p.is_file():
+            return {"ok": False, "error": f"file not found: {p}"}
+        text = p.read_text(encoding="utf-8", errors="ignore")
+        text = text[: max(500, min(max_chars, 300000))]
+        return {
+            "ok": True,
+            "path": str(p),
+            "text": text,
+            "line_count": text.count("\n") + 1 if text else 0,
+            "suffix": p.suffix.lower(),
+        }
+
+    def read_code_span(path: str, start_line: int = 1, end_line: int = 200) -> Dict[str, Any]:
+        row = read_code_file(path=path, max_chars=300000)
+        if not row.get("ok"):
+            return row
+        text = str(row.get("text", ""))
+        lines = text.splitlines()
+        total = len(lines)
+        start = max(1, int(start_line or 1))
+        end = max(start, int(end_line or start))
+        start = min(start, max(1, total))
+        end = min(end, max(1, total))
+        selected = lines[start - 1 : end]
+        numbered = []
+        for idx, line in enumerate(selected, start=start):
+            numbered.append(f"{idx}: {line}")
+        return {
+            "ok": True,
+            "path": row.get("path"),
+            "start_line": start,
+            "end_line": end,
+            "line_count": total,
+            "content": "\n".join(numbered),
+        }
+
+    def replace_text_in_file(path: str, find_text: str, replace_text: str, count: int = 1) -> Dict[str, Any]:
+        if not path:
+            return {"ok": False, "error": "path is required"}
+        if find_text is None or find_text == "":
+            return {"ok": False, "error": "find_text is required"}
+        p = resolve_workspace_file(path)
+        if not p.exists() or not p.is_file():
+            return {"ok": False, "error": f"file not found: {p}"}
+        original = p.read_text(encoding="utf-8", errors="ignore")
+        replace_limit = -1 if int(count) <= 0 else int(count)
+        replaced = original.replace(find_text, replace_text, replace_limit)
+        if replaced == original:
+            return {"ok": False, "error": "find_text not found", "path": str(p), "replacements": 0}
+        num_replacements = original.count(find_text) if replace_limit == -1 else min(original.count(find_text), replace_limit)
+        p.write_text(replaced, encoding="utf-8")
+        return {"ok": True, "path": str(p), "replacements": num_replacements}
+
+    def run_shell_command(command: str, timeout_s: int = 90, approved: bool = False) -> Dict[str, Any]:
+        if not command or not str(command).strip():
+            return {"ok": False, "error": "command is required"}
+        cmd = str(command).strip()
+        if re.match(r"^pip(?:\d+(?:\.\d+)*)?\s+", cmd):
+            cmd = re.sub(r"^pip(?:\d+(?:\.\d+)*)?\s+", "python3 -m pip ", cmd, count=1)
+        blocked_patterns = [
+            r"\brm\s+-rf\s+/",
+            r"\bsudo\b",
+            r"\bshutdown\b",
+            r"\breboot\b",
+            r"\bmkfs\b",
+            r"\bdd\s+if=",
+            r"\bgit\s+reset\s+--hard\b",
+            r":\(\)\s*\{",
+        ]
+        for pat in blocked_patterns:
+            if re.search(pat, cmd, flags=re.IGNORECASE):
+                return {"ok": False, "error": f"command blocked by safety rule: {pat}"}
+
+        try:
+            proc = subprocess.run(
+                ["/bin/zsh", "-lc", cmd],
+                cwd=str(workspace_path),
+                capture_output=True,
+                text=True,
+                timeout=max(1, min(int(timeout_s or 90), 300)),
+            )
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "error": "command timed out"}
+        except Exception as e:
+            return {"ok": False, "error": f"failed to run command: {e}"}
+
+        stdout = truncate_text(proc.stdout or "", max_chars=12000)
+        stderr = truncate_text(proc.stderr or "", max_chars=12000)
+        ok = proc.returncode == 0
+        return {
+            "ok": ok,
+            "command": cmd,
+            "cwd": str(workspace_path),
+            "return_code": proc.returncode,
+            "stdout": stdout,
+            "stderr": stderr,
+            "approved": bool(approved),
+        }
 
     def list_available_tools() -> Dict[str, Any]:
         return {"tools": tools.list_tools()}
@@ -2853,8 +4355,18 @@ def build_tool_registry(memory: MemoryStore, workspace: str) -> ToolRegistry:
         ToolSpec(
             name="read_csv_preview",
             func=read_csv_preview,
-            description="Preview CSV headers and rows.",
+            description="Preview CSV headers and rows (legacy alias; for CSV/XLSX use read_spreadsheet_preview).",
             input_schema={"path": "string", "max_rows": "int"},
+            permission="file_read",
+            owner_agent="data_agent",
+        )
+    )
+    tools.register(
+        ToolSpec(
+            name="read_spreadsheet_preview",
+            func=read_spreadsheet_preview,
+            description="Preview tabular data from .csv or .xlsx with headers and sample rows.",
+            input_schema={"path": "string", "max_rows": "int", "sheet_name": "string|null"},
             permission="file_read",
             owner_agent="data_agent",
         )
@@ -2863,10 +4375,32 @@ def build_tool_registry(memory: MemoryStore, workspace: str) -> ToolRegistry:
         ToolSpec(
             name="profile_csv_columns",
             func=profile_csv_columns,
-            description="Infer basic column stats for CSV data.",
+            description="Infer basic column stats for CSV data (legacy alias).",
             input_schema={"path": "string", "max_rows": "int"},
             permission="data_exec",
             owner_agent="data_agent",
+        )
+    )
+    tools.register(
+        ToolSpec(
+            name="profile_tabular_columns",
+            func=profile_tabular_columns,
+            description="Infer basic column stats for .csv or .xlsx data.",
+            input_schema={"path": "string", "max_rows": "int", "sheet_name": "string|null"},
+            permission="data_exec",
+            owner_agent="data_agent",
+        )
+    )
+    tools.register(
+        ToolSpec(
+            name="analyze_tabular_with_python",
+            func=analyze_tabular_with_python,
+            description="Write a temporary Python analyzer script, execute it, and return tabular analysis for .csv/.xlsx/text files.",
+            input_schema={"path": "string", "max_rows": "int", "timeout_s": "int"},
+            permission="code_exec",
+            owner_agent="code_agent",
+            timeout_s=240,
+            retry=0,
         )
     )
     tools.register(
@@ -2877,6 +4411,50 @@ def build_tool_registry(memory: MemoryStore, workspace: str) -> ToolRegistry:
             input_schema={"path": "string", "text": "string", "overwrite": "bool"},
             permission="file_write",
             owner_agent="reporter",
+        )
+    )
+    tools.register(
+        ToolSpec(
+            name="read_code_file",
+            func=read_code_file,
+            description="Read source code/config file in workspace.",
+            input_schema={"path": "string", "max_chars": "int"},
+            permission="file_read",
+            owner_agent="code_agent",
+        )
+    )
+    tools.register(
+        ToolSpec(
+            name="read_code_span",
+            func=read_code_span,
+            description="Read a code file with line numbers for a specific line range.",
+            input_schema={"path": "string", "start_line": "int", "end_line": "int"},
+            examples=["read_code_span(path='multi_agent_system.py', start_line=1, end_line=120)"],
+            permission="file_read",
+            owner_agent="code_agent",
+        )
+    )
+    tools.register(
+        ToolSpec(
+            name="replace_text_in_file",
+            func=replace_text_in_file,
+            description="Replace text in a workspace file for deterministic code edits.",
+            input_schema={"path": "string", "find_text": "string", "replace_text": "string", "count": "int"},
+            permission="file_write",
+            owner_agent="code_agent",
+        )
+    )
+    tools.register(
+        ToolSpec(
+            name="run_shell_command",
+            func=run_shell_command,
+            description="Run a shell command in workspace root and return stdout/stderr.",
+            input_schema={"command": "string", "timeout_s": "int", "approved": "bool"},
+            examples=["run_shell_command(command='pytest -q', timeout_s=120)", "run_shell_command(command='python3 terminal_chat.py --help')"],
+            permission="code_exec",
+            owner_agent="code_agent",
+            timeout_s=180,
+            retry=0,
         )
     )
     tools.register(
@@ -3086,6 +4664,7 @@ class MultiAgentSystem:
             "trainer": TrainerAgent(self.tools),
             "evaluator": EvaluatorAgent(self.tools),
             "reporter": ReporterAgent(self.tools),
+            "code_agent": CodeAgent(self.tools),
             "experience_agent": self.experience_agent,
         }
         self.supervisor = Supervisor(self.agents)
@@ -3156,6 +4735,12 @@ class MultiAgentSystem:
             "workflow_plan": [],
             "workflow_cursor": 0,
             "workflow_task": "",
+            "workflow_intent": "",
+            "code_path": None,
+            "command": None,
+            "find_text": None,
+            "replace_text": None,
+            "count": 1,
             "artifacts": {},
             "executed_steps": [],
             "plan": None,
