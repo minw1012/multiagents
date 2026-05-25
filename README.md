@@ -53,8 +53,8 @@ Harness = Tools + Knowledge + Observation + Action Interfaces + Permissions
 ### Main Code Locations
 - Runtime and tools: `multi_agent_system.py`
 - Terminal interface: `terminal_chat.py`
-- Redesign notes: `system_redesign.md`
-- Communication notes: `multi_agent_commu.md`
+- Modular entrypoints (phase 1): `src/core`, `src/tools`, `src/agents`, `src/policy`, `src/skills`
+- Architecture docs: `docs/architecture.md`, `docs/tools.md`, `docs/dev-guide.md`
 
 ## Main Features
 
