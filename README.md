@@ -10,30 +10,43 @@ Modern agent systems often fail because control logic is overfit to brittle inte
 ## Summary Figure
 
 ```mermaid
-flowchart TD
-    U[User Request] --> M["messages[]"]
+flowchart LR
+    U([User Request]) --> M["messages"]
     M --> L[LLM Controller]
-    L --> R{tool_use?}
-    R -- yes --> T[Execute Tool Calls]
-    T --> O[Append tool_result blocks]
-    O --> M
-    R -- no --> A[Return Final Answer]
+    L --> D{Need tool call now?}
 
-    subgraph Harness
+    D -- Yes --> T[Execute Tool Calls]
+    T --> P[Policy Check]
+    P --> O[Append tool_result + observations]
+    O --> M
+
+    D -- No --> J{Enough info to answer?}
+    J -- Yes --> F([FINAL: Return final answer])
+    J -- No --> C([CLARIFY/CHAT: Ask focused question])
+
+    subgraph Runtime Harness
         H1[Tool Registry]
         H2[Execution Policy]
         H3[Memory Store]
-        H4[Observations / Events]
+        H4[Event Log]
     end
 
     T --- H1
-    T --- H2
+    P --- H2
     O --- H3
     O --- H4
+
+    classDef decision fill:#263238,stroke:#90a4ae,color:#ffffff;
+    classDef done fill:#1b4332,stroke:#52b788,color:#ffffff;
+    classDef clarify fill:#5f3dc4,stroke:#b197fc,color:#ffffff;
+    class D,J decision;
+    class F done;
+    class C clarify;
 ```
 
 The model is responsible for control decisions.
 The runtime is responsible for execution, safety checks, and state updates.
+When `Need tool call now?` is `No`, the controller can either finish (`FINAL`) or return a clarification question (`CLARIFY/CHAT`) if information is still missing.
 
 ## System
 
