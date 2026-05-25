@@ -1,0 +1,25 @@
+from typing import Dict
+
+TOOL_RISK_BY_PERMISSION: Dict[str, str] = {
+    "tool_read": "low",
+    "file_read": "low",
+    "kb_read": "low",
+    "skill_read": "low",
+    "observe_read": "low",
+    "network_read": "medium",
+    "db_read": "medium",
+    "browser_read": "medium",
+    "nlp_local": "low",
+    "data_exec": "low",
+    "ml_plan": "low",
+    "ml_eval": "low",
+    "ml_train": "medium",
+    "network_write": "high",
+    "db_write": "high",
+    "browser_action": "high",
+    "report_write": "medium",
+    "kb_write": "medium",
+    "file_write": "medium",
+    "code_exec": "medium",
+    "skill_install": "high",
+}

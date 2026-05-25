@@ -12,7 +12,12 @@ A modular import surface is now available under `src/`:
 - `src/policy`: execution policy
 - `src/skills`: skill store
 
-These modules currently re-export from the legacy file.
+Phase 2 progress:
+
+- `src/tools/registry.py` now owns `ToolSpec` and `ToolRegistry`.
+- `src/skills/store.py` now owns `SkillStore`.
+- `src/policy/execution.py` and `src/policy/risk.py` now own policy logic and risk map.
+- `multi_agent_system.py` imports these components instead of defining them inline.
 
 ## Target Runtime (Phase 2)
 

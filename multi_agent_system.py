@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import csv
 import hashlib
 import heapq
@@ -15,16 +14,18 @@ import time
 import urllib.request
 import urllib.parse
 import urllib.error
-import ipaddress
 import zipfile
 from html import unescape
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
+from src.policy.execution import ExecutionPolicy
+from src.skills.store import SkillStore
+from src.tools.registry import ToolRegistry, ToolSpec
+
 
 Message = Dict[str, Any]
 State = Dict[str, Any]
-ToolFunc = Callable[..., Dict[str, Any]]
 
 
 def now_ms() -> int:
@@ -83,31 +84,6 @@ UNSUPPORTED_EXECUTION_REPLY = (
     "This request is outside the currently executable pipeline. "
     "Current executable scope: KNOWLEDGE_LOOKUP, DOC_SUMMARY, CODE_TASK, tabular ML workflow, network/API calls, sqlite queries, and lightweight browser actions."
 )
-
-
-TOOL_RISK_BY_PERMISSION: Dict[str, str] = {
-    "tool_read": "low",
-    "file_read": "low",
-    "kb_read": "low",
-    "skill_read": "low",
-    "observe_read": "low",
-    "network_read": "medium",
-    "db_read": "medium",
-    "browser_read": "medium",
-    "nlp_local": "low",
-    "data_exec": "low",
-    "ml_plan": "low",
-    "ml_eval": "low",
-    "ml_train": "medium",
-    "network_write": "high",
-    "db_write": "high",
-    "browser_action": "high",
-    "report_write": "medium",
-    "kb_write": "medium",
-    "file_write": "medium",
-    "code_exec": "medium",
-    "skill_install": "high",
-}
 
 
 def default_general_chat_payload() -> Dict[str, Any]:
@@ -930,143 +906,6 @@ class MemoryStore:
             raise ValueError(f"unknown namespace: {namespace}")
 
 
-@dataclass
-class ToolSpec:
-    name: str
-    func: ToolFunc
-    description: str = ""
-    input_schema: Dict[str, Any] = field(default_factory=dict)
-    output_schema: Dict[str, Any] = field(default_factory=dict)
-    examples: List[str] = field(default_factory=list)
-    timeout_s: int = 60
-    retry: int = 0
-    permission: str = "default"
-    owner_agent: str = "supervisor"
-
-
-class ToolRegistry:
-    def __init__(self):
-        self.tools: Dict[str, ToolSpec] = {}
-
-    def register(self, spec: ToolSpec) -> None:
-        self.tools[spec.name] = spec
-
-    def execute(self, name: str, **kwargs: Any) -> Dict[str, Any]:
-        if name not in self.tools:
-            raise ValueError(f"tool not found: {name}")
-        spec = self.tools[name]
-        return spec.func(**kwargs)
-
-    def get_spec(self, name: str) -> Optional[ToolSpec]:
-        return self.tools.get(name)
-
-    def list_tools(self) -> List[Dict[str, Any]]:
-        out = []
-        for spec in self.tools.values():
-            out.append(
-                {
-                    "name": spec.name,
-                    "description": spec.description,
-                    "input_schema": spec.input_schema,
-                    "examples": spec.examples,
-                    "permission": spec.permission,
-                    "risk_level": TOOL_RISK_BY_PERMISSION.get(spec.permission, "medium"),
-                    "owner_agent": spec.owner_agent,
-                    "timeout_s": spec.timeout_s,
-                    "retry": spec.retry,
-                }
-            )
-        return out
-
-    def catalog_for_planner(self) -> List[Dict[str, Any]]:
-        rows = []
-        for spec in self.tools.values():
-            rows.append(
-                {
-                    "name": spec.name,
-                    "description": spec.description,
-                    "input_schema": spec.input_schema,
-                    "permission": spec.permission,
-                    "risk_level": TOOL_RISK_BY_PERMISSION.get(spec.permission, "medium"),
-                }
-            )
-        return rows
-
-
-class SkillStore:
-    """
-    Stores downloaded skills and a small local manifest.
-    Skills can be pulled from online git repositories and then exposed to agents as tools.
-    """
-
-    def __init__(self, root: str):
-        self.root = Path(root).expanduser().resolve()
-        self.root.mkdir(parents=True, exist_ok=True)
-        self.manifest_path = self.root / "skills_manifest.json"
-        self._manifest = self._load_manifest()
-
-    def _load_manifest(self) -> Dict[str, Any]:
-        if not self.manifest_path.exists():
-            return {"skills": []}
-        try:
-            data = json.loads(self.manifest_path.read_text(encoding="utf-8"))
-            if isinstance(data, dict) and isinstance(data.get("skills"), list):
-                return data
-        except Exception:
-            pass
-        return {"skills": []}
-
-    def _save_manifest(self) -> None:
-        self.manifest_path.write_text(json.dumps(self._manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    def list_skills(self) -> List[Dict[str, Any]]:
-        return list(self._manifest.get("skills", []))
-
-    def install_from_git(self, repo_url: str, ref: Optional[str] = None, alias: Optional[str] = None) -> Dict[str, Any]:
-        if not repo_url or not isinstance(repo_url, str):
-            return {"ok": False, "error": "repo_url is required"}
-
-        safe_name = (alias or Path(repo_url.rstrip("/")).stem or f"skill_{now_ms()}").replace(" ", "_")
-        target = self.root / safe_name
-
-        if target.exists() and (target / ".git").exists():
-            pull_cmd = ["git", "-C", str(target), "pull", "--ff-only"]
-            pull = subprocess.run(pull_cmd, capture_output=True, text=True)
-            if pull.returncode != 0:
-                return {"ok": False, "error": pull.stderr.strip() or pull.stdout.strip()}
-        elif target.exists() and not (target / ".git").exists():
-            return {"ok": False, "error": f"target exists and is not a git repo: {target}"}
-        else:
-            clone_cmd = ["git", "clone", repo_url, str(target)]
-            clone = subprocess.run(clone_cmd, capture_output=True, text=True)
-            if clone.returncode != 0:
-                return {"ok": False, "error": clone.stderr.strip() or clone.stdout.strip()}
-
-        if ref:
-            checkout_cmd = ["git", "-C", str(target), "checkout", ref]
-            checkout = subprocess.run(checkout_cmd, capture_output=True, text=True)
-            if checkout.returncode != 0:
-                return {"ok": False, "error": checkout.stderr.strip() or checkout.stdout.strip()}
-
-        rev_cmd = ["git", "-C", str(target), "rev-parse", "HEAD"]
-        rev = subprocess.run(rev_cmd, capture_output=True, text=True)
-        commit = rev.stdout.strip() if rev.returncode == 0 else ""
-
-        record = {
-            "name": safe_name,
-            "repo_url": repo_url,
-            "path": str(target),
-            "ref": ref or "default",
-            "commit": commit,
-            "installed_at_ms": now_ms(),
-        }
-        skills = [s for s in self._manifest.get("skills", []) if s.get("name") != safe_name]
-        skills.append(record)
-        self._manifest["skills"] = skills
-        self._save_manifest()
-        return {"ok": True, "skill": record}
-
-
 class BaseAgent:
     def __init__(self, name: str):
         self.name = name
@@ -1131,116 +970,6 @@ class Scheduler:
             else:
                 still_waiting.append(task)
         self.waiting = still_waiting
-
-
-class ExecutionPolicy:
-    """
-    Codex-inspired safety gate:
-    - categorize tool calls by risk
-    - enforce explicit approval for high-risk actions
-    - return machine-readable decision for orchestrator
-    """
-
-    def __init__(self):
-        self._risk_by_permission = dict(TOOL_RISK_BY_PERMISSION)
-        self._trusted_domains = {
-            "raw.githubusercontent.com",
-            "github.com",
-            "api.github.com",
-            "localhost",
-            "127.0.0.1",
-        }
-        env_domains = os.getenv("TRUSTED_NETWORK_DOMAINS", "").strip()
-        if env_domains:
-            for item in env_domains.split(","):
-                dom = item.strip().lower()
-                if dom:
-                    self._trusted_domains.add(dom)
-
-    def risk_level(self, permission: str) -> str:
-        return self._risk_by_permission.get(permission, "medium")
-
-    def _host_is_private_or_local(self, host: str) -> bool:
-        host_l = (host or "").strip().lower()
-        if not host_l:
-            return True
-        if host_l in {"localhost", "127.0.0.1", "::1"}:
-            return True
-        try:
-            ip = ipaddress.ip_address(host_l)
-            return bool(ip.is_private or ip.is_loopback or ip.is_link_local)
-        except Exception:
-            return False
-
-    def _check_network_boundary(self, tool_name: str, args: Dict[str, Any]) -> Tuple[bool, str]:
-        url = str(args.get("url", "")).strip()
-        if not url:
-            return True, "no_url"
-        try:
-            parsed = urllib.parse.urlparse(url)
-        except Exception:
-            return False, f"invalid URL for `{tool_name}`."
-        scheme = (parsed.scheme or "").lower()
-        host = (parsed.hostname or "").lower()
-        if scheme not in {"http", "https"}:
-            return False, f"Blocked `{tool_name}`: only http/https URLs are allowed."
-        if scheme == "http" and host not in {"localhost", "127.0.0.1"}:
-            return False, f"Blocked `{tool_name}`: non-local HTTP is not allowed; use HTTPS."
-        if self._host_is_private_or_local(host) and host not in {"localhost", "127.0.0.1"}:
-            return False, f"Blocked `{tool_name}`: private network host is outside trust boundary."
-        if host and host not in self._trusted_domains:
-            approved = parse_bool(args.get("approved"), default=False)
-            if not approved:
-                return (
-                    False,
-                    f"Host `{host}` is outside trusted domains. Add `approved=true` to allow this network access.",
-                )
-        return True, "network_allowed"
-
-    def _check_filesystem_boundary(self, tool_name: str, args: Dict[str, Any]) -> Tuple[bool, str]:
-        db_path = str(args.get("db_path", "")).strip()
-        if not db_path:
-            return True, "no_db_path"
-        p = Path(db_path).expanduser()
-        if p.is_absolute():
-            # Allow local absolute paths but block dangerous system roots.
-            blocked_prefixes = ["/etc", "/bin", "/sbin", "/usr/bin", "/System", "/private/etc"]
-            if any(str(p).startswith(pref) for pref in blocked_prefixes):
-                return False, f"Blocked `{tool_name}`: database path is outside allowed trust boundary."
-        return True, "fs_allowed"
-
-    def evaluate(self, tool_name: str, spec: ToolSpec, args: Dict[str, Any], task: str) -> Dict[str, Any]:
-        risk = self.risk_level(spec.permission)
-        approved = parse_bool(args.get("approved"), default=False)
-        task_l = task.lower()
-
-        if spec.permission in {"network_read", "network_write"}:
-            ok, reason = self._check_network_boundary(tool_name=tool_name, args=args)
-            if not ok:
-                return {"allow": False, "risk": risk, "reason": reason}
-        if spec.permission in {"db_read", "db_write"}:
-            ok, reason = self._check_filesystem_boundary(tool_name=tool_name, args=args)
-            if not ok:
-                return {"allow": False, "risk": risk, "reason": reason}
-
-        if not approved and risk == "high":
-            approved = ("approve" in task_l and tool_name.lower() in task_l) or ("approved" in task_l)
-
-        if risk == "high" and not approved:
-            return {
-                "allow": False,
-                "risk": risk,
-                "reason": (
-                    f"Tool `{tool_name}` is high risk ({spec.permission}). "
-                    "Add `approved=true` for this tool call or explicitly approve in your request."
-                ),
-            }
-
-        return {
-            "allow": True,
-            "risk": risk,
-            "reason": "allowed",
-        }
 
 
 class ExperienceAgent(BaseAgent):
