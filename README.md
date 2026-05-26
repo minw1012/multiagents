@@ -1,4 +1,4 @@
-# Multiagents: A Model-Driven Tool-Using Agent Runtime
+# AgentFoundry: Agent Runtime with Contracts, Verifier, and Skill Distillation
 
 This repository contains the runtime implementation of a multi-agent terminal system built around a canonical tool-calling loop.
 
