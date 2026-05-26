@@ -111,6 +111,22 @@
       "ref": "master",
       "commit": "",
       "installed_at_ms": 0
+    },
+    {
+      "name": "skill_search_workspace_text",
+      "repo_url": "local_distilled",
+      "path": "/Users/max/Documents/multiagents/skills/distilled/skill_search_workspace_text",
+      "ref": "local",
+      "commit": "",
+      "installed_at_ms": 1779773898686
+    },
+    {
+      "name": "skill_read_document_file",
+      "repo_url": "local_distilled",
+      "path": "/Users/max/Documents/multiagents/skills/distilled/skill_read_document_file",
+      "ref": "local",
+      "commit": "",
+      "installed_at_ms": 1779773931716
     }
   ]
 }

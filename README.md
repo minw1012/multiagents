@@ -25,9 +25,15 @@ Harness = Tools + Knowledge + Observation + Action Interfaces + Permissions
 
 ### Runtime Components
 - `DynamicLoopOrchestrator`: primary controller with model-native tool loop and fallback execution path.
+- `MCTS plan optimizer`: searches multiple candidate plans and selects higher-scoring execution workflows before runtime.
+- `Constraint/Verifier/Selector pipeline`:
+  - `constraint_agent` builds per-step contracts (preconditions/postconditions).
+  - `selector_agent` dynamically chooses reasoning/tool/code/clarification actions.
+  - `verifier_agent` validates each step output and emits fix suggestions.
 - `ToolRegistry`: typed tool catalog with schemas, permissions, ownership, retries, and timeouts.
 - `ExecutionPolicy`: risk-aware gating, approval checks, trust boundaries for network/filesystem actions.
 - `MemoryStore`: session history, workflow events, knowledge documents, and experience records.
+- `ExperienceAgent`: captures solved runs and distills reusable local skills under `skills/distilled/`.
 - `terminal_chat.py`: interactive terminal interface for human-in-the-loop execution.
 
 ### Main Code Locations
@@ -107,6 +113,13 @@ The runtime includes explicit recovery mechanisms:
 - recovery step synthesis and dynamic insertion
 - reflection logging and repeat-guard behavior
 - focused clarification when recovery budget is exhausted
+- step-level contract precheck and post-execution verification (`precondition -> execute -> verify -> recover/replan`)
+- verifier notes attached to execution output for traceability
+
+### Experience Distillation
+- each completed run can be summarized into an experience entry (`skills/experience_catalog.json`)
+- experience is distilled into a local skill (`skills/distilled/<skill_name>/SKILL.md`)
+- distilled skills are auto-registered in `skills/skills_manifest.json` with `repo_url=local_distilled`
 
 ### Policy Model
 - permission-level risk mapping (`low`, `medium`, `high`)
