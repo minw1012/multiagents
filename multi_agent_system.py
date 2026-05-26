@@ -978,11 +978,18 @@ class ExperienceAgent(BaseAgent):
     Persists entries under `skills/experience_catalog.json`.
     """
 
-    def __init__(self, memory: MemoryStore, workspace: str, model: str = "gpt-4o"):
+    def __init__(
+        self,
+        memory: MemoryStore,
+        workspace: str,
+        model: str = "gpt-4o",
+        runtime_tool_names: Optional[List[str]] = None,
+    ):
         super().__init__("experience_agent")
         self.memory = memory
         self.workspace = Path(workspace).expanduser().resolve()
         self.model = model
+        self.runtime_tool_names = set([str(x).strip() for x in (runtime_tool_names or []) if str(x).strip()])
         self.catalog_path = self.workspace / "skills" / "experience_catalog.json"
         self.catalog_path.parent.mkdir(parents=True, exist_ok=True)
         self.client = None
@@ -1070,6 +1077,136 @@ class ExperienceAgent(BaseAgent):
         payload["skills"] = rows
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
         manifest_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _normalize_tool_chain(self, tool_chain: Any) -> List[str]:
+        if not isinstance(tool_chain, list):
+            return []
+        out: List[str] = []
+        for raw in tool_chain:
+            name = str(raw).strip()
+            if not name:
+                continue
+            if self.runtime_tool_names and name not in self.runtime_tool_names:
+                continue
+            out.append(name)
+        return out[:12]
+
+    def _tool_chain_signature(self, tool_chain: List[str]) -> str:
+        return " -> ".join([str(x).strip() for x in tool_chain if str(x).strip()])
+
+    def _extract_tool_chain_from_skill_md(self, skill_md_path: Path) -> List[str]:
+        if not skill_md_path.exists() or not skill_md_path.is_file():
+            return []
+        try:
+            raw = skill_md_path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            return []
+        in_chain = False
+        out: List[str] = []
+        for line in raw.splitlines():
+            stripped = line.strip()
+            if stripped.lower().startswith("## tool chain"):
+                in_chain = True
+                continue
+            if stripped.startswith("## ") and in_chain:
+                break
+            if not in_chain:
+                continue
+            m = re.search(r"`([a-zA-Z_][a-zA-Z0-9_]*)`", stripped)
+            if not m:
+                continue
+            name = m.group(1).strip()
+            if not name:
+                continue
+            if self.runtime_tool_names and name not in self.runtime_tool_names:
+                continue
+            out.append(name)
+        return out[:12]
+
+    def _existing_skill_signatures(self) -> set[str]:
+        signatures: set[str] = set()
+        manifest_path = self.workspace / "skills" / "skills_manifest.json"
+        if not manifest_path.exists():
+            return signatures
+        try:
+            data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            return signatures
+        rows = data.get("skills", []) if isinstance(data, dict) else []
+        if not isinstance(rows, list):
+            return signatures
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            path = str(row.get("path", "")).strip()
+            if not path:
+                continue
+            chain = self._extract_tool_chain_from_skill_md(Path(path) / "SKILL.md")
+            sig = self._tool_chain_signature(chain)
+            if sig:
+                signatures.add(sig)
+        return signatures
+
+    def _existing_experience_signatures(self) -> set[str]:
+        signatures: set[str] = set()
+        for row in self.memory.all_experiences():
+            if not isinstance(row, dict):
+                continue
+            candidate = ensure_dict(row.get("skill_candidate", {}))
+            chain = self._normalize_tool_chain(candidate.get("tool_chain", []))
+            if not chain:
+                chain = self._normalize_tool_chain(row.get("executed_tools", []))
+            sig = self._tool_chain_signature(chain)
+            if sig:
+                signatures.add(sig)
+        return signatures
+
+    def _should_distill_experience(self, entry: Dict[str, Any]) -> Dict[str, Any]:
+        intent = str(entry.get("intent", "")).upper().strip()
+        status = str(entry.get("status", "")).lower().strip()
+        executed_tools = self._normalize_tool_chain(entry.get("executed_tools", []))
+        failed = entry.get("what_failed", [])
+        failed_count = len(failed) if isinstance(failed, list) else 0
+        candidate = ensure_dict(entry.get("skill_candidate", {}))
+        tool_chain = self._normalize_tool_chain(candidate.get("tool_chain", []))
+        if not tool_chain:
+            tool_chain = executed_tools
+
+        if intent == "GENERAL_CHAT":
+            return {"allow": False, "reason": "intent_is_general_chat"}
+        if status in {"clarification_needed", "clarify", "chat", "unknown"}:
+            return {"allow": False, "reason": f"status_not_distillable:{status}"}
+        if not tool_chain:
+            return {"allow": False, "reason": "empty_tool_chain"}
+        if len(executed_tools) < 2 and intent not in {"DOC_SUMMARY", "KNOWLEDGE_LOOKUP", "DYNAMIC_EXECUTION"}:
+            return {"allow": False, "reason": "insufficient_tool_depth"}
+        failure_rate = failed_count / max(1, len(executed_tools))
+        if failure_rate > 0.5:
+            return {"allow": False, "reason": f"high_failure_rate:{round(failure_rate, 3)}"}
+
+        signature = self._tool_chain_signature(tool_chain)
+        if not signature:
+            return {"allow": False, "reason": "empty_signature"}
+
+        existing_signatures = self._existing_skill_signatures() | self._existing_experience_signatures()
+        if signature in existing_signatures:
+            return {"allow": False, "reason": "duplicate_tool_chain_signature"}
+
+        chain_set = set(tool_chain)
+        for sig in existing_signatures:
+            sig_set = set([x.strip() for x in sig.split("->") if x.strip()])
+            if not sig_set:
+                continue
+            overlap = len(chain_set & sig_set) / max(1, len(chain_set | sig_set))
+            if overlap >= 0.8:
+                return {"allow": False, "reason": f"near_duplicate_overlap:{round(overlap, 3)}"}
+
+        return {
+            "allow": True,
+            "reason": "pass",
+            "tool_chain_signature": signature,
+            "failure_rate": round(failure_rate, 4),
+        }
 
     def _distill_experience_to_skill(self, entry: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         candidate = ensure_dict(entry.get("skill_candidate", {}))
@@ -1278,12 +1415,17 @@ class ExperienceAgent(BaseAgent):
         }
         self.memory.put_experience(exp_id, entry)
         self._save_catalog()
+        distill_decision = self._should_distill_experience(entry)
+        entry["distill_decision"] = distill_decision
+        self.memory.put_experience(exp_id, entry)
+        self._save_catalog()
         try:
-            distilled = self._distill_experience_to_skill(entry)
-            if distilled:
-                entry["distilled_skill"] = distilled
-                self.memory.put_experience(exp_id, entry)
-                self._save_catalog()
+            if distill_decision.get("allow", False):
+                distilled = self._distill_experience_to_skill(entry)
+                if distilled:
+                    entry["distilled_skill"] = distilled
+                    self.memory.put_experience(exp_id, entry)
+                    self._save_catalog()
         except Exception:
             pass
         return entry
@@ -1317,6 +1459,7 @@ class DynamicLoopOrchestrator:
                 self.client = OpenAI(api_key=api_key)
             except Exception:
                 self.client = None
+        self.enable_verifier = parse_bool(os.getenv("ENABLE_VERIFIER", "1"), default=True)
 
     def available(self) -> bool:
         return self.client is not None
@@ -2293,171 +2436,6 @@ class DynamicLoopOrchestrator:
             )
         return contracts
 
-    def _score_plan_candidate(self, task: str, plan: List[Dict[str, Any]]) -> float:
-        if not isinstance(plan, list) or not plan:
-            return -100.0
-        score = 0.0
-        for idx, step in enumerate(plan[:12]):
-            if not isinstance(step, dict):
-                score -= 10.0
-                continue
-            tool = str(step.get("tool", "")).strip()
-            args = ensure_dict(step.get("arguments", {}))
-            if tool:
-                if tool in self.tools.tools:
-                    score += 4.0
-                else:
-                    score -= 12.0
-            else:
-                score += 0.5
-            if "approved" in args:
-                score -= 0.8
-            if any(k in args for k in ["path", "file_path", "query", "task", "command"]):
-                score += 0.6
-            if idx > 0:
-                prev_tool = str(plan[idx - 1].get("tool", "")).strip() if isinstance(plan[idx - 1], dict) else ""
-                if prev_tool and tool and prev_tool == tool:
-                    score -= 0.4
-        score -= 0.7 * max(0, len(plan) - 6)
-        exp_hits = self.memory.search_experiences(task, top_k=3)
-        for row in exp_hits:
-            chain = row.get("executed_tools", [])
-            if not isinstance(chain, list):
-                continue
-            overlap = len(set([str(x) for x in chain]) & set([str(s.get("tool", "")).strip() for s in plan if isinstance(s, dict)]))
-            score += min(2.4, 0.5 * overlap)
-        return round(score, 4)
-
-    def _normalize_step(self, step: Dict[str, Any], fallback_idx: int) -> Dict[str, Any]:
-        row = ensure_dict(step)
-        tool = str(row.get("tool", "")).strip()
-        if tool and tool not in self.tools.tools:
-            tool = ""
-        return {
-            "step": str(row.get("step", f"Step {fallback_idx+1}")).strip() or f"Step {fallback_idx+1}",
-            "tool": tool,
-            "arguments": ensure_dict(row.get("arguments", {})),
-        }
-
-    def _candidate_plans(self, base_plan: List[Dict[str, Any]], task: str, max_candidates: int = 10) -> List[List[Dict[str, Any]]]:
-        normalized_base = [self._normalize_step(step, idx) for idx, step in enumerate(base_plan[:16]) if isinstance(step, dict)]
-        if not normalized_base:
-            normalized_base = [{"step": "Search workspace context", "tool": "search_workspace_text", "arguments": {"query": task, "top_k": 20}}]
-
-        candidates: List[List[Dict[str, Any]]] = [normalized_base]
-        # Candidate 1: remove empty-tool steps.
-        no_empty = [dict(step) for step in normalized_base if str(step.get("tool", "")).strip()]
-        if no_empty:
-            candidates.append(no_empty)
-        # Candidate 2: prepend semantic search context.
-        candidates.append(
-            [{"step": "Gather workspace context", "tool": "search_workspace_text", "arguments": {"query": task, "top_k": 30}}]
-            + [dict(step) for step in normalized_base]
-        )
-        # Candidate 3: append observation summary.
-        candidates.append(
-            [dict(step) for step in normalized_base]
-            + [{"step": "Observe current git diff", "tool": "observe_git_diff", "arguments": {"max_chars": 16000}}]
-        )
-        # Candidate 4+: leverage recent successful tool chains.
-        for row in self.memory.search_experiences(task, top_k=5):
-            chain = row.get("executed_tools", [])
-            if not isinstance(chain, list) or not chain:
-                continue
-            tool_steps: List[Dict[str, Any]] = []
-            for idx, name in enumerate(chain[:8]):
-                tool_name = str(name).strip()
-                if not tool_name or tool_name not in self.tools.tools:
-                    continue
-                args: Dict[str, Any] = {"task": task}
-                if tool_name == "search_workspace_text":
-                    args = {"query": task, "top_k": 30}
-                elif tool_name == "kb_search":
-                    args = {"query": task, "top_k": 5}
-                tool_steps.append({"step": f"Reuse experience tool {idx+1}", "tool": tool_name, "arguments": args})
-            if tool_steps:
-                candidates.append(tool_steps)
-            if len(candidates) >= max_candidates:
-                break
-
-        # Deduplicate by signature.
-        uniq: Dict[str, List[Dict[str, Any]]] = {}
-        for plan in candidates:
-            normalized = [self._normalize_step(step, idx) for idx, step in enumerate(plan[:16])]
-            sig = json.dumps(normalized, ensure_ascii=False, sort_keys=True)
-            if sig not in uniq:
-                uniq[sig] = normalized
-            if len(uniq) >= max_candidates:
-                break
-        return list(uniq.values())
-
-    def _mcts_optimize_plan(
-        self,
-        task: str,
-        goal: str,
-        base_plan: List[Dict[str, Any]],
-        constraints: List[str],
-        success_criteria: List[str],
-        iterations: int = 24,
-    ) -> Dict[str, Any]:
-        candidates = self._candidate_plans(base_plan=base_plan, task=task, max_candidates=12)
-        if not candidates:
-            return {"plan": base_plan, "mcts": {"iterations": 0, "selected_index": 0, "scores": []}}
-
-        visits = [0 for _ in candidates]
-        total_values = [0.0 for _ in candidates]
-        scores: List[Dict[str, Any]] = []
-        parent_visits = 0
-        c = 1.4
-
-        for _ in range(max(6, min(iterations, 64))):
-            parent_visits += 1
-            selected = 0
-            best_uct = -10**9
-            for idx, plan in enumerate(candidates):
-                if visits[idx] == 0:
-                    uct = 10**6 + idx
-                else:
-                    avg = total_values[idx] / max(1, visits[idx])
-                    explore = c * math.sqrt(math.log(max(1, parent_visits)) / visits[idx])
-                    uct = avg + explore
-                if uct > best_uct:
-                    best_uct = uct
-                    selected = idx
-            score = self._score_plan_candidate(task=task, plan=candidates[selected])
-            # Light constraint alignment bonus.
-            if constraints:
-                score += 0.2
-            if success_criteria:
-                score += 0.2
-            visits[selected] += 1
-            total_values[selected] += score
-
-        best_idx = 0
-        best_avg = -10**9
-        for idx, plan in enumerate(candidates):
-            avg = total_values[idx] / max(1, visits[idx])
-            if avg > best_avg:
-                best_avg = avg
-                best_idx = idx
-            scores.append(
-                {
-                    "index": idx,
-                    "visits": visits[idx],
-                    "avg_score": round(avg, 4),
-                    "steps": [str(step.get("tool", "")).strip() for step in plan],
-                }
-            )
-        return {
-            "plan": candidates[best_idx],
-            "mcts": {
-                "iterations": parent_visits,
-                "selected_index": best_idx,
-                "selected_avg_score": round(best_avg, 4),
-                "scores": scores[:10],
-            },
-        }
-
     def _constraint_agent(self, loop_state: Dict[str, Any]) -> Dict[str, Any]:
         contracts = self._build_step_contracts(
             plan=loop_state.get("plan", []),
@@ -2995,15 +2973,22 @@ class DynamicLoopOrchestrator:
                 "event_log_tail": self.memory.get_workflow_events(trace_id, limit=12),
             }
 
-        mcts_row = self._mcts_optimize_plan(
-            task=task,
-            goal=str(understanding.get("goal", "")),
-            base_plan=plan,
-            constraints=understanding.get("constraints", []),
-            success_criteria=understanding.get("success_criteria", []),
-        )
-        optimized_plan = mcts_row.get("plan", plan)
-        mcts_meta = mcts_row.get("mcts", {})
+        optimized_plan: List[Dict[str, Any]] = []
+        if isinstance(plan, list):
+            for idx, step in enumerate(plan[:16]):
+                row = ensure_dict(step)
+                tool = str(row.get("tool", "")).strip()
+                if tool and tool not in self.tools.tools:
+                    tool = ""
+                optimized_plan.append(
+                    {
+                        "step": str(row.get("step", f"Step {idx+1}")).strip() or f"Step {idx+1}",
+                        "tool": tool,
+                        "arguments": ensure_dict(row.get("arguments", {})),
+                    }
+                )
+        if not optimized_plan:
+            optimized_plan = [{"step": "Search workspace context", "tool": "search_workspace_text", "arguments": {"query": task, "top_k": 20}}]
 
         loop_state: Dict[str, Any] = {
             "trace_id": trace_id,
@@ -3020,23 +3005,11 @@ class DynamicLoopOrchestrator:
             "events": [start_event],
             "reflections": [],
             "recovery_stats": {},
-            "mcts": mcts_meta,
             "step_contracts": [],
             "verifier_notes": [],
         }
         constraint_row = self._constraint_agent(loop_state)
         loop_state["step_contracts"] = constraint_row.get("contracts", [])
-        loop_state["events"].append(
-            self._record_event(
-                trace_id,
-                "mcts_plan",
-                {
-                    "selected_avg_score": mcts_meta.get("selected_avg_score", None),
-                    "plan_steps": len(loop_state.get("plan", [])),
-                    "iterations": mcts_meta.get("iterations", 0),
-                },
-            )
-        )
 
         max_iterations = 12
         repeated_calls: Dict[str, int] = {}
@@ -3069,7 +3042,6 @@ class DynamicLoopOrchestrator:
                     "observations": loop_state["observations"][-8:],
                     "reflections": loop_state.get("reflections", [])[-8:],
                     "verifier_notes": loop_state.get("verifier_notes", [])[-8:],
-                    "mcts": loop_state.get("mcts", {}),
                     "result_summary": answer,
                     "trace_id": trace_id,
                     "event_log_tail": self.memory.get_workflow_events(trace_id, limit=20),
@@ -3348,46 +3320,75 @@ class DynamicLoopOrchestrator:
                     },
                 )
             )
-            verifier = self._verifier_agent(
-                loop_state=loop_state,
-                decision=decision,
-                ok=ok,
-                result=result if isinstance(result, dict) else {"value": result},
-                error=str(error or ""),
-            )
-            loop_state.setdefault("verifier_notes", []).append(
-                {
-                    "iteration": iteration,
-                    "tool": tool_name,
-                    "pass": verifier.get("pass", False),
-                    "root_cause": verifier.get("root_cause", ""),
-                    "checks": verifier.get("checks", []),
-                    "fix_suggestion": verifier.get("fix_suggestion", ""),
-                }
-            )
-            loop_state["events"].append(
-                self._record_event(
-                    trace_id,
-                    "verify",
+            if self.enable_verifier:
+                verifier = self._verifier_agent(
+                    loop_state=loop_state,
+                    decision=decision,
+                    ok=ok,
+                    result=result if isinstance(result, dict) else {"value": result},
+                    error=str(error or ""),
+                )
+                loop_state.setdefault("verifier_notes", []).append(
                     {
                         "iteration": iteration,
                         "tool": tool_name,
                         "pass": verifier.get("pass", False),
                         "root_cause": verifier.get("root_cause", ""),
+                        "checks": verifier.get("checks", []),
                         "fix_suggestion": verifier.get("fix_suggestion", ""),
-                    },
+                    }
                 )
-            )
-            if not verifier.get("pass", False):
-                loop_state["reflections"].append(
+                loop_state["events"].append(
+                    self._record_event(
+                        trace_id,
+                        "verify",
+                        {
+                            "iteration": iteration,
+                            "tool": tool_name,
+                            "pass": verifier.get("pass", False),
+                            "root_cause": verifier.get("root_cause", ""),
+                            "fix_suggestion": verifier.get("fix_suggestion", ""),
+                        },
+                    )
+                )
+                if not verifier.get("pass", False):
+                    loop_state["reflections"].append(
+                        {
+                            "iteration": iteration,
+                            "reason": "verifier_failed",
+                            "root_cause": verifier.get("root_cause", ""),
+                            "decision_quality": "weak",
+                            "fix_applied": verifier.get("fix_suggestion", ""),
+                            "outcome": "needs_recovery",
+                        }
+                    )
+                verifier_pass = bool(verifier.get("pass", False))
+                verifier_root = str(verifier.get("root_cause", ""))
+            else:
+                verifier_pass = bool(ok)
+                verifier_root = ""
+                loop_state.setdefault("verifier_notes", []).append(
                     {
                         "iteration": iteration,
-                        "reason": "verifier_failed",
-                        "root_cause": verifier.get("root_cause", ""),
-                        "decision_quality": "weak",
-                        "fix_applied": verifier.get("fix_suggestion", ""),
-                        "outcome": "needs_recovery",
+                        "tool": tool_name,
+                        "pass": verifier_pass,
+                        "root_cause": "",
+                        "checks": ["verifier disabled"],
+                        "fix_suggestion": "",
                     }
+                )
+                loop_state["events"].append(
+                    self._record_event(
+                        trace_id,
+                        "verify",
+                        {
+                            "iteration": iteration,
+                            "tool": tool_name,
+                            "pass": verifier_pass,
+                            "root_cause": "",
+                            "fix_suggestion": "verifier_disabled",
+                        },
+                    )
                 )
             recovery = self._reflect_and_recover(
                 loop_state=loop_state,
@@ -3395,8 +3396,8 @@ class DynamicLoopOrchestrator:
                 task=task,
                 tool_name=tool_name,
                 args=args,
-                ok=bool(ok and verifier.get("pass", False)),
-                error=str(error or verifier.get("root_cause", "")),
+                ok=bool(ok and verifier_pass),
+                error=str(error or verifier_root),
             )
             loop_state["events"].append(
                 self._record_event(
@@ -3446,7 +3447,6 @@ class DynamicLoopOrchestrator:
             "observations": loop_state["observations"][-8:],
             "reflections": loop_state.get("reflections", [])[-8:],
             "verifier_notes": loop_state.get("verifier_notes", [])[-8:],
-            "mcts": loop_state.get("mcts", {}),
             "result_summary": self._compose_final_answer(loop_state),
             "trace_id": trace_id,
             "event_log_tail": self.memory.get_workflow_events(trace_id, limit=20),
@@ -6493,6 +6493,7 @@ class MultiAgentSystem:
             memory=self.memory,
             workspace=self.workspace,
             model=experience_model,
+            runtime_tool_names=list(self.tools.tools.keys()),
         )
         self.agents: Dict[str, BaseAgent] = {
             "intent_router": IntentRouterAgent(self.understanding_engine),
