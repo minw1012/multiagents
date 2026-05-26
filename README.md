@@ -110,15 +110,19 @@ python3 terminal_chat.py --workspace . --model gpt-4o
 The runtime includes explicit recovery mechanisms:
 - failure classification (`missing_input`, `parse_error`, `timeout`, `policy_block`, `command_missing`, `json_error`)
 - recovery step synthesis and dynamic insertion
-- reflection logging and repeat-guard behavior
+- structured reflection logging (`reason`, `root_cause`, `decision_quality`, `fix_applied`, `outcome`)
+- repeat-guard behavior for repetitive failing calls
 - focused clarification when recovery budget is exhausted
 - step-level contract precheck and post-execution verification (`precondition -> execute -> verify -> recover/replan`)
 - verifier notes attached to execution output for traceability
 
 ### Experience Distillation
 - each completed run can be summarized into an experience entry (`skills/experience_catalog.json`)
-- experience is distilled into a local skill (`skills/distilled/<skill_name>/SKILL.md`)
+- distilled skill generation is gated by quality checks (intent/status/tool-depth/failure-rate)
+- distillation is deduplicated against existing skill tool-chains and prior experience signatures
+- experience is distilled into a local skill only when gate checks pass (`skills/distilled/<skill_name>/SKILL.md`)
 - distilled skills are auto-registered in `skills/skills_manifest.json` with `repo_url=local_distilled`
+- distillation decision metadata is persisted on experience entries (`distill_decision`)
 
 ### Policy Model
 - permission-level risk mapping (`low`, `medium`, `high`)
